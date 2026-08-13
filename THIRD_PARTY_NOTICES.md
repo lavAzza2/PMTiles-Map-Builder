@@ -27,3 +27,12 @@ distributed under its BSD-style license. See
 The Windows package is produced with PyInstaller. Its bootloader exception
 permits distribution of the resulting executable under the application's
 license. See [pyinstaller.org](https://pyinstaller.org/).
+
+## GDAL (optional, not included)
+
+GeoTIFF and KMZ conversion can use an independently installed GDAL/OSGeo4W or
+QGIS distribution. GDAL is not included in the compact Windows package. GDAL
+is distributed under an MIT-style license; individual format drivers and data
+packages may have additional notices. See
+[gdal.org](https://gdal.org/en/stable/license.html) and the notices supplied by
+the installed distribution.

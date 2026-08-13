@@ -12,8 +12,10 @@ from map_builder_core import (
     convert_mbtiles,
     find_pmtiles_cli,
     parse_hlg,
+    raster_to_pmtiles,
     read_pmtiles_header,
     write_report,
+    xyz_to_pmtiles,
 )
 
 
@@ -38,11 +40,13 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("THS2 Map Builder")
-        self.geometry("760x690")
-        self.minsize(720, 620)
+        self.geometry("800x790")
+        self.minsize(740, 690)
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.mode = tk.StringVar(value="cache")
         self.mbtiles = tk.StringVar()
+        self.raster = tk.StringVar()
+        self.xyz_folder = tk.StringVar()
         self.cache = tk.StringVar(value=str(DEFAULT_CACHE) if SAS_ROOT else "")
         self.selection = tk.StringVar(value=str(DEFAULT_SELECTION) if SAS_ROOT else "")
         self.output = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR / "THS2-map.pmtiles"))
@@ -50,6 +54,8 @@ class App(tk.Tk):
         self.attribution = tk.StringVar()
         self.min_zoom = tk.IntVar(value=13)
         self.max_zoom = tk.IntVar(value=19)
+        self.raster_format = tk.StringVar(value="PNG")
+        self.jpeg_quality = tk.IntVar(value=85)
         self.status = tk.StringVar(value="Готов к работе")
         self._build()
         self.after(100, self._poll)
@@ -68,7 +74,7 @@ class App(tk.Tk):
         modes.pack(fill="x")
         ttk.Radiobutton(
             modes,
-            text="Экспортированный MBTiles — надёжный запасной путь",
+            text="MBTiles — готовый архив тайлов",
             variable=self.mode,
             value="mbtiles",
             command=self._refresh_mode,
@@ -80,31 +86,70 @@ class App(tk.Tk):
             value="cache",
             command=self._refresh_mode,
         ).pack(anchor="w", pady=(5, 0))
+        ttk.Radiobutton(
+            modes,
+            text="GeoTIFF или KMZ — геопривязанный растр",
+            variable=self.mode,
+            value="raster",
+            command=self._refresh_mode,
+        ).pack(anchor="w", pady=(5, 0))
+        ttk.Radiobutton(
+            modes,
+            text="Папка XYZ — тайлы в папках z/x/y",
+            variable=self.mode,
+            value="xyz",
+            command=self._refresh_mode,
+        ).pack(anchor="w", pady=(5, 0))
 
         self.inputs = ttk.LabelFrame(root, text="2. Файлы и область", padding=12)
         self.inputs.pack(fill="x", pady=12)
         self.mb_row = self._path_row(
             self.inputs, "Файл MBTiles", self.mbtiles, self._choose_mbtiles, 0
         )
+        self.raster_row = self._path_row(
+            self.inputs, "GeoTIFF или KMZ", self.raster, self._choose_raster, 1
+        )
+        self.xyz_row = self._path_row(
+            self.inputs, "Папка тайлов XYZ", self.xyz_folder, self._choose_xyz, 2
+        )
         self.cache_row = self._path_row(
-            self.inputs, "Папка cache_sqlite", self.cache, self._choose_cache, 1
+            self.inputs, "Папка cache_sqlite", self.cache, self._choose_cache, 3
         )
         self.selection_row = self._path_row(
-            self.inputs, "Выделение .hlg", self.selection, self._choose_selection, 2
+            self.inputs, "Выделение .hlg", self.selection, self._choose_selection, 4
         )
-        zooms = ttk.Frame(self.inputs)
-        zooms.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Label(zooms, text="Масштабы THS2:").pack(side="left")
-        ttk.Spinbox(zooms, from_=0, to=24, width=4, textvariable=self.min_zoom).pack(
+        self.zoom_row = ttk.Frame(self.inputs)
+        self.zoom_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(self.zoom_row, text="Масштабы THS2:").pack(side="left")
+        ttk.Spinbox(self.zoom_row, from_=0, to=24, width=4, textvariable=self.min_zoom).pack(
             side="left", padx=(8, 4)
         )
-        ttk.Label(zooms, text="—").pack(side="left")
-        ttk.Spinbox(zooms, from_=0, to=24, width=4, textvariable=self.max_zoom).pack(
+        ttk.Label(self.zoom_row, text="—").pack(side="left")
+        ttk.Spinbox(self.zoom_row, from_=0, to=24, width=4, textvariable=self.max_zoom).pack(
             side="left", padx=4
         )
-        ttk.Label(
-            zooms, text="(для кэша; SAS показывает их на единицу выше)", foreground="#666666"
+        self.zoom_hint = ttk.Label(self.zoom_row, foreground="#666666")
+        self.zoom_hint.pack(side="left", padx=8)
+
+        self.raster_options = ttk.Frame(self.inputs)
+        self.raster_options.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+        ttk.Label(self.raster_options, text="Формат тайлов:").pack(side="left")
+        ttk.Combobox(
+            self.raster_options,
+            textvariable=self.raster_format,
+            values=("PNG", "JPEG"),
+            state="readonly",
+            width=7,
+        ).pack(side="left", padx=(8, 14))
+        ttk.Label(self.raster_options, text="Качество JPEG:").pack(side="left")
+        ttk.Spinbox(
+            self.raster_options, from_=50, to=100, width=4, textvariable=self.jpeg_quality
         ).pack(side="left", padx=8)
+        ttk.Label(
+            self.raster_options,
+            text="PNG сохраняет прозрачность; JPEG обычно заметно меньше",
+            foreground="#666666",
+        ).pack(side="left", padx=6)
 
         details = ttk.LabelFrame(root, text="3. Готовая карта", padding=12)
         details.pack(fill="x")
@@ -151,16 +196,53 @@ class App(tk.Tk):
         parent.columnconfigure(1, weight=1)
 
     def _refresh_mode(self):
-        cache_mode = self.mode.get() == "cache"
-        self.mb_row.grid() if not cache_mode else self.mb_row.grid_remove()
-        self.cache_row.grid() if cache_mode else self.cache_row.grid_remove()
-        self.selection_row.grid() if cache_mode else self.selection_row.grid_remove()
+        mode = self.mode.get()
+        for row in (self.mb_row, self.raster_row, self.xyz_row, self.cache_row, self.selection_row):
+            row.grid_remove()
+        if mode == "mbtiles":
+            self.mb_row.grid()
+        elif mode == "raster":
+            self.raster_row.grid()
+        elif mode == "xyz":
+            self.xyz_row.grid()
+        else:
+            self.cache_row.grid()
+            self.selection_row.grid()
+        if mode in {"cache", "raster"}:
+            self.zoom_row.grid()
+            self.zoom_hint.configure(
+                text="(SAS показывает на единицу выше)" if mode == "cache" else "(уровни итоговой карты)"
+            )
+        else:
+            self.zoom_row.grid_remove()
+        self.raster_options.grid() if mode == "raster" else self.raster_options.grid_remove()
 
     def _choose_mbtiles(self):
         value = filedialog.askopenfilename(filetypes=[("MBTiles", "*.mbtiles")])
         if value:
             self.mbtiles.set(value)
             self.output.set(str(Path(value).with_suffix(".pmtiles")))
+
+    def _choose_raster(self):
+        value = filedialog.askopenfilename(
+            filetypes=[
+                ("Геопривязанные растры", "*.tif *.tiff *.kmz"),
+                ("GeoTIFF", "*.tif *.tiff"),
+                ("KMZ", "*.kmz"),
+                ("Все файлы", "*.*"),
+            ]
+        )
+        if value:
+            self.raster.set(value)
+            self.name.set(Path(value).stem)
+            self.output.set(str(Path(value).with_suffix(".pmtiles")))
+
+    def _choose_xyz(self):
+        value = filedialog.askdirectory(title="Выбери папку, внутри которой находятся z/x/y")
+        if value:
+            self.xyz_folder.set(value)
+            self.name.set(Path(value).name)
+            self.output.set(str(DEFAULT_OUTPUT_DIR / f"{Path(value).name}.pmtiles"))
 
     def _choose_cache(self):
         value = filedialog.askdirectory()
@@ -230,6 +312,20 @@ class App(tk.Tk):
                     "attribution_notice": self.attribution.get().strip(),
                 }
                 write_report(output.with_suffix(".report.json"), report)
+            elif self.mode.get() == "raster":
+                result = raster_to_pmtiles(
+                    Path(self.raster.get()), output,
+                    int(self.min_zoom.get()), int(self.max_zoom.get()),
+                    self.name.get().strip(), self.attribution.get().strip(), cli,
+                    self.raster_format.get(), int(self.jpeg_quality.get()),
+                    log=self._worker_log,
+                )
+            elif self.mode.get() == "xyz":
+                result = xyz_to_pmtiles(
+                    Path(self.xyz_folder.get()), output,
+                    self.name.get().strip(), self.attribution.get().strip(),
+                    cli, self._worker_log,
+                )
             else:
                 selection = parse_hlg(Path(self.selection.get()))
                 self._worker_log(f"Границы выделения: {selection['bbox']}")
