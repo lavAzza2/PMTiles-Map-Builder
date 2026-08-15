@@ -12,16 +12,120 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, Iterable
 
 
 Log = Callable[[str], None]
+Progress = Callable[[str, int | None], None]
+GIB = 1024 ** 3
+
+
+def working_space_requirements(input_size: int, source_type: str) -> dict[str, int]:
+    """Return conservative free-space recommendations for a conversion."""
+    input_size = max(0, int(input_size))
+    if source_type == "raster":
+        temporary = max(10 * GIB, input_size * 8)
+        output = max(2 * GIB, input_size * 3)
+    elif source_type == "mbtiles":
+        temporary = max(4 * GIB, input_size * 3)
+        output = max(1 * GIB, int(input_size * 1.25))
+    else:
+        temporary = max(5 * GIB, input_size * 4)
+        output = max(1 * GIB, int(input_size * 1.5))
+    return {"temporary": temporary, "output": output}
+
+
+def format_bytes(value: int) -> str:
+    if value >= GIB:
+        return f"{value / GIB:.1f} ГБ"
+    return f"{value / 1024 ** 2:.0f} МБ"
+
+
+def mbtiles_index_status(path: Path) -> dict[str, object]:
+    """Inspect whether a tile table (or normalized map table) has a Z/X/Y index."""
+    connection = _readonly_connection(path)
+    try:
+        object_row = connection.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'tiles'"
+        ).fetchone()
+        if not object_row:
+            raise ValueError("В MBTiles не найдена таблица или представление tiles.")
+        table = "tiles" if object_row[0] == "table" else "map"
+        columns = {
+            row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")
+        }
+        required = {"zoom_level", "tile_column", "tile_row"}
+        if not required.issubset(columns):
+            return {"table": table, "indexed": False, "can_create": False}
+        for index_row in connection.execute(f"PRAGMA index_list('{table}')"):
+            index_name = str(index_row[1]).replace("'", "''")
+            index_columns = [
+                row[2]
+                for row in connection.execute(f"PRAGMA index_info('{index_name}')")
+            ]
+            if index_columns[:3] == ["zoom_level", "tile_column", "tile_row"]:
+                return {"table": table, "indexed": True, "can_create": True}
+        return {"table": table, "indexed": False, "can_create": True}
+    finally:
+        connection.close()
+
+
+def ensure_mbtiles_index(path: Path, log: Log = print) -> dict[str, object]:
+    """Create a performance index in a writable working copy, never in source."""
+    status = mbtiles_index_status(path)
+    if status["indexed"]:
+        log("Индекс тайлов найден.")
+        return status
+    if not status["can_create"]:
+        log("Структура MBTiles нестандартная; автоматический индекс создать нельзя.")
+        return status
+    table = str(status["table"])
+    connection = sqlite3.connect(path)
+    try:
+        log(f"Создаю индекс {table}(zoom_level, tile_column, tile_row)…")
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS ths2_tiles_zxy_idx "
+            f"ON {table}(zoom_level, tile_column, tile_row)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    status["indexed"] = True
+    status["created"] = True
+    log("Индекс рабочей копии создан.")
+    return status
+
+
+def copy_file_with_progress(
+    source: Path,
+    destination: Path,
+    log: Log = print,
+    progress: Progress | None = None,
+) -> None:
+    total = source.stat().st_size
+    copied = 0
+    started = time.monotonic()
+    if progress:
+        progress("Копирование MBTiles", 0)
+    with source.open("rb") as reader, destination.open("wb") as writer:
+        while chunk := reader.read(8 * 1024 * 1024):
+            writer.write(chunk)
+            copied += len(chunk)
+            if progress and total:
+                progress("Копирование MBTiles", min(100, copied * 100 // total))
+    elapsed = max(0.01, time.monotonic() - started)
+    log(
+        f"Рабочая копия создана: {format_bytes(total)} за {elapsed:.1f} с "
+        f"({format_bytes(int(total / elapsed))}/с)."
+    )
 
 
 def parse_hlg(path: Path) -> dict:
@@ -173,6 +277,7 @@ def build_mbtiles_from_xyz(
     name: str,
     attribution: str,
     log: Log = print,
+    progress: Progress | None = None,
 ) -> dict:
     """Build MBTiles from a read-only XYZ directory laid out as z/x/y.ext."""
     if not tiles_root.is_dir():
@@ -191,7 +296,7 @@ def build_mbtiles_from_xyz(
             (path for path in tiles_root.iterdir() if path.is_dir() and path.name.isdigit()),
             key=lambda path: int(path.name),
         )
-        for zoom_folder in zoom_folders:
+        for zoom_index, zoom_folder in enumerate(zoom_folders, start=1):
             zoom = int(zoom_folder.name)
             if not 0 <= zoom <= 24:
                 continue
@@ -233,6 +338,8 @@ def build_mbtiles_from_xyz(
                 inserted += zoom_count
                 target.commit()
             log(f"Масштаб {zoom}: найдено {zoom_count} тайлов.")
+            if progress and zoom_folders:
+                progress("Сборка XYZ", zoom_index * 100 // len(zoom_folders))
 
         if not inserted or tile_format is None:
             raise ValueError("В папке не найдены тайлы со структурой z/x/y.png (или jpg/webp/avif).")
@@ -301,6 +408,7 @@ def build_mbtiles_from_cache(
     name: str,
     attribution: str,
     log: Log = print,
+    progress: Progress | None = None,
 ) -> dict:
     if not cache_root.is_dir():
         raise FileNotFoundError(f"Не найдена папка кэша: {cache_root}")
@@ -365,6 +473,11 @@ def build_mbtiles_from_cache(
                         zoom_count += 1
             inserted += zoom_count
             log(f"Масштаб {zoom}: найдено {zoom_count} тайлов.")
+            if progress:
+                progress(
+                    "Чтение кэша SAS.Planet",
+                    (zoom - min_zoom + 1) * 100 // (max_zoom - min_zoom + 1),
+                )
             target.commit()
 
         if inserted == 0 or tile_format is None:
@@ -425,29 +538,102 @@ def find_pmtiles_cli(explicit_path: str | None = None) -> Path:
     )
 
 
-def run_pmtiles(
-    cli: Path, arguments: list[str], log: Log = print, check: bool = True
+def _extract_progress(text: str) -> int | None:
+    percent_matches = re.findall(r"(?<!\d)(\d{1,3})\s*%", text)
+    if percent_matches:
+        return min(100, int(percent_matches[-1]))
+    gdal_matches = re.findall(r"(?<!\d)(\d{1,3})\.\.\.", text)
+    if gdal_matches:
+        return min(100, int(gdal_matches[-1]))
+    return None
+
+
+def _safe_log(log: Log, line: str) -> None:
+    try:
+        log(line)
+    except UnicodeEncodeError:
+        # Legacy Windows consoles often use cp1251 and cannot render the
+        # Unicode blocks used by the PMTiles progress bar. Logging must never
+        # interrupt or orphan the conversion process.
+        log(line.encode("ascii", "replace").decode("ascii"))
+
+
+def run_process_streaming(
+    executable: Path,
+    arguments: list[str],
+    log: Log = print,
+    progress: Progress | None = None,
+    stage: str = "Обработка",
+    env: dict[str, str] | None = None,
+    emit_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    command = [str(cli), *arguments]
-    result = subprocess.run(
+    """Run a hidden child process while streaming CR/LF progress to the GUI."""
+    command = [str(executable), *arguments]
+    if progress:
+        progress(stage, None)
+    process = subprocess.Popen(
         command,
         text=True,
         encoding="utf-8",
         errors="replace",
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=env,
     )
-    for line in (result.stdout + "\n" + result.stderr).splitlines():
-        if line.strip():
-            clean_line = line.strip()
-            try:
-                log(clean_line)
-            except UnicodeEncodeError:
-                # Legacy Windows consoles may use cp1251 and reject the CLI's
-                # Unicode progress bar. The GUI itself accepts the original.
-                log(clean_line.encode("ascii", "replace").decode("ascii"))
+    output_parts: list[str] = []
+    pending = ""
+    last_line = ""
+    last_percent: int | None = None
+    assert process.stdout is not None
+    while True:
+        character = process.stdout.read(1)
+        if character == "" and process.poll() is not None:
+            break
+        if not character:
+            continue
+        output_parts.append(character)
+        if character in "\r\n":
+            clean_line = pending.strip()
+            if emit_output and clean_line and clean_line != last_line:
+                _safe_log(log, clean_line)
+                last_line = clean_line
+            pending = ""
+            continue
+        pending += character
+        current_percent = _extract_progress(pending)
+        if current_percent is not None and current_percent != last_percent:
+            last_percent = current_percent
+            if progress:
+                progress(stage, current_percent)
+    clean_line = pending.strip()
+    if emit_output and clean_line and clean_line != last_line:
+        _safe_log(log, clean_line)
+    process.stdout.close()
+    return_code = process.wait()
+    if progress and return_code == 0 and last_percent != 100:
+        progress(stage, 100)
+    return subprocess.CompletedProcess(
+        command, return_code, "".join(output_parts), ""
+    )
+
+
+def run_pmtiles(
+    cli: Path,
+    arguments: list[str],
+    log: Log = print,
+    check: bool = True,
+    progress: Progress | None = None,
+    stage: str = "PMTiles",
+) -> subprocess.CompletedProcess[str]:
+    result = run_process_streaming(cli, arguments, log, progress, stage)
     if check and result.returncode != 0:
-        raise RuntimeError(f"PMTiles CLI завершился с кодом {result.returncode}.")
+        tail = result.stdout.strip()[-1000:]
+        raise RuntimeError(
+            f"PMTiles CLI завершился с кодом {result.returncode}."
+            + (f"\n{tail}" if tail else "")
+        )
     return result
 
 
@@ -498,26 +684,20 @@ def run_external(
     arguments: list[str],
     log: Log = print,
     emit_output: bool = True,
+    progress: Progress | None = None,
+    stage: str = "GDAL",
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PATH"] = str(executable.parent) + os.pathsep + env.get("PATH", "")
-    result = subprocess.run(
-        [str(executable), *arguments],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        env=env,
+    result = run_process_streaming(
+        executable, arguments, log, progress, stage, env, emit_output
     )
-    if emit_output:
-        for line in (result.stdout + "\n" + result.stderr).splitlines():
-            if line.strip():
-                log(line.strip())
     if result.returncode != 0:
+        tail = result.stdout.strip()[-1000:]
         raise RuntimeError(
             f"{executable.name} завершился с кодом {result.returncode}. "
             "Проверь географическую привязку исходного файла."
+            + (f"\n{tail}" if tail else "")
         )
     return result
 
@@ -533,6 +713,8 @@ def build_mbtiles_from_raster(
     jpeg_quality: int = 85,
     gdal_folder: str | None = None,
     log: Log = print,
+    temp_dir: Path | None = None,
+    progress: Progress | None = None,
 ) -> dict:
     """Reproject a GeoTIFF/KMZ raster to Web Mercator and create MBTiles."""
     if not input_path.is_file():
@@ -550,7 +732,8 @@ def build_mbtiles_from_raster(
     if output_path.exists():
         output_path.unlink()
     info = run_external(
-        tools["gdalinfo"], ["-json", str(input_path)], log, emit_output=False
+        tools["gdalinfo"], ["-json", str(input_path)], log, emit_output=False,
+        progress=progress, stage="Проверка геопривязки"
     )
     try:
         info_payload = json.loads(info.stdout)
@@ -563,7 +746,10 @@ def build_mbtiles_from_raster(
         )
 
     resolution = 156543.03392804097 / (1 << max_zoom)
-    with tempfile.TemporaryDirectory(prefix="ths2-map-builder-raster-") as folder:
+    with tempfile.TemporaryDirectory(
+        prefix="ths2-map-builder-raster-",
+        dir=str(temp_dir) if temp_dir else None,
+    ) as folder:
         warped = Path(folder) / "web-mercator.vrt"
         warp_arguments = [
             "-overwrite", "-of", "VRT", "-t_srs", "EPSG:3857",
@@ -574,7 +760,10 @@ def build_mbtiles_from_raster(
             warp_arguments.append("-dstalpha")
         warp_arguments.extend((str(input_path), str(warped)))
         log(f"Перепроецирование в Web Mercator, максимальный масштаб {max_zoom}…")
-        run_external(tools["gdalwarp"], warp_arguments, log)
+        run_external(
+            tools["gdalwarp"], warp_arguments, log, progress=progress,
+            stage="Перепроецирование"
+        )
 
         translate_arguments = [
             "-of", "MBTILES", "-co", f"TILE_FORMAT={tile_format}",
@@ -585,7 +774,10 @@ def build_mbtiles_from_raster(
             translate_arguments.extend(("-co", f"QUALITY={jpeg_quality}"))
         translate_arguments.extend((str(warped), str(output_path)))
         log("Нарезка растра на тайлы…")
-        run_external(tools["gdal_translate"], translate_arguments, log)
+        run_external(
+            tools["gdal_translate"], translate_arguments, log, progress=progress,
+            stage="Нарезка тайлов"
+        )
 
         if min_zoom < max_zoom:
             overview_factors = [str(1 << step) for step in range(1, max_zoom - min_zoom + 1)]
@@ -594,6 +786,8 @@ def build_mbtiles_from_raster(
                 tools["gdaladdo"],
                 ["-r", "average", str(output_path), *overview_factors],
                 log,
+                progress=progress,
+                stage="Создание масштабов",
             )
 
     connection = sqlite3.connect(output_path)
@@ -641,6 +835,9 @@ def convert_mbtiles(
     log: Log = print,
     name: str | None = None,
     attribution: str | None = None,
+    no_deduplication: bool = False,
+    temp_dir: Path | None = None,
+    progress: Progress | None = None,
 ) -> dict:
     if not input_path.is_file():
         raise FileNotFoundError(f"Не найден MBTiles: {input_path}")
@@ -649,10 +846,14 @@ def convert_mbtiles(
         output_path.unlink()
     conversion_input = input_path
     temporary: tempfile.TemporaryDirectory[str] | None = None
-    if name is not None or attribution is not None:
-        temporary = tempfile.TemporaryDirectory(prefix="ths2-map-builder-metadata-")
+    index_status = mbtiles_index_status(input_path)
+    if name is not None or attribution is not None or not index_status["indexed"]:
+        temporary = tempfile.TemporaryDirectory(
+            prefix="ths2-map-builder-metadata-",
+            dir=str(temp_dir) if temp_dir else None,
+        )
         conversion_input = Path(temporary.name) / input_path.name
-        shutil.copyfile(input_path, conversion_input)
+        copy_file_with_progress(input_path, conversion_input, log, progress)
         metadata_connection = sqlite3.connect(conversion_input)
         try:
             for key, value in (("name", name), ("attribution", attribution)):
@@ -665,12 +866,31 @@ def convert_mbtiles(
             metadata_connection.commit()
         finally:
             metadata_connection.close()
+        if progress:
+            progress("Индексирование MBTiles", None)
+        ensure_mbtiles_index(conversion_input, log)
+        if progress:
+            progress("Индексирование MBTiles", 100)
+    else:
+        log("Индекс исходного MBTiles найден; дополнительная копия не требуется.")
     try:
-        run_pmtiles(cli, ["convert", str(conversion_input), str(output_path)], log)
+        arguments = ["convert"]
+        if no_deduplication:
+            arguments.append("--no-deduplication")
+            log("Быстрый режим: дедупликация тайлов отключена.")
+        if temp_dir:
+            arguments.extend(("--tmpdir", str(temp_dir)))
+        arguments.extend((str(conversion_input), str(output_path)))
+        run_pmtiles(
+            cli, arguments, log, progress=progress, stage="Упаковка PMTiles"
+        )
     finally:
         if temporary is not None:
             temporary.cleanup()
-    run_pmtiles(cli, ["verify", str(output_path)], log)
+    run_pmtiles(
+        cli, ["verify", str(output_path)], log, progress=progress,
+        stage="Проверка PMTiles"
+    )
     return read_pmtiles_header(output_path)
 
 
@@ -706,8 +926,13 @@ def cache_to_pmtiles(
     attribution: str,
     cli: Path,
     log: Log = print,
+    no_deduplication: bool = False,
+    temp_dir: Path | None = None,
+    progress: Progress | None = None,
 ) -> dict:
-    with tempfile.TemporaryDirectory(prefix="ths2-map-builder-") as temp_folder:
+    with tempfile.TemporaryDirectory(
+        prefix="ths2-map-builder-", dir=str(temp_dir) if temp_dir else None
+    ) as temp_folder:
         mbtiles_path = Path(temp_folder) / "cache-export.mbtiles"
         cache_result = build_mbtiles_from_cache(
             cache_root,
@@ -718,8 +943,14 @@ def cache_to_pmtiles(
             name,
             attribution,
             log,
+            progress,
         )
-        pmtiles_result = convert_mbtiles(mbtiles_path, output_path, cli, log)
+        pmtiles_result = convert_mbtiles(
+            mbtiles_path, output_path, cli, log,
+            no_deduplication=no_deduplication,
+            temp_dir=temp_dir,
+            progress=progress,
+        )
     result = {
         "status": "ok",
         "source": "sasplanet-cache-read-only",
@@ -738,13 +969,23 @@ def xyz_to_pmtiles(
     attribution: str,
     cli: Path,
     log: Log = print,
+    no_deduplication: bool = False,
+    temp_dir: Path | None = None,
+    progress: Progress | None = None,
 ) -> dict:
-    with tempfile.TemporaryDirectory(prefix="ths2-map-builder-xyz-") as temp_folder:
+    with tempfile.TemporaryDirectory(
+        prefix="ths2-map-builder-xyz-", dir=str(temp_dir) if temp_dir else None
+    ) as temp_folder:
         mbtiles_path = Path(temp_folder) / "xyz-export.mbtiles"
         source_result = build_mbtiles_from_xyz(
-            tiles_root, mbtiles_path, name, attribution, log
+            tiles_root, mbtiles_path, name, attribution, log, progress
         )
-        pmtiles_result = convert_mbtiles(mbtiles_path, output_path, cli, log)
+        pmtiles_result = convert_mbtiles(
+            mbtiles_path, output_path, cli, log,
+            no_deduplication=no_deduplication,
+            temp_dir=temp_dir,
+            progress=progress,
+        )
     result = {
         "status": "ok",
         "source_type": "xyz-directory-read-only",
@@ -770,8 +1011,13 @@ def raster_to_pmtiles(
     jpeg_quality: int = 85,
     gdal_folder: str | None = None,
     log: Log = print,
+    no_deduplication: bool = False,
+    temp_dir: Path | None = None,
+    progress: Progress | None = None,
 ) -> dict:
-    with tempfile.TemporaryDirectory(prefix="ths2-map-builder-raster-") as temp_folder:
+    with tempfile.TemporaryDirectory(
+        prefix="ths2-map-builder-raster-", dir=str(temp_dir) if temp_dir else None
+    ) as temp_folder:
         mbtiles_path = Path(temp_folder) / "raster-export.mbtiles"
         source_result = build_mbtiles_from_raster(
             input_path,
@@ -784,8 +1030,15 @@ def raster_to_pmtiles(
             jpeg_quality,
             gdal_folder,
             log,
+            temp_dir,
+            progress,
         )
-        pmtiles_result = convert_mbtiles(mbtiles_path, output_path, cli, log)
+        pmtiles_result = convert_mbtiles(
+            mbtiles_path, output_path, cli, log,
+            no_deduplication=no_deduplication,
+            temp_dir=temp_dir,
+            progress=progress,
+        )
     result = {
         "status": "ok",
         "source_type": "georeferenced-raster",

@@ -1,22 +1,77 @@
 import tempfile
 from pathlib import Path
 import sqlite3
+import sys
 import unittest
 
 from map_builder_core import (
+    _extract_progress,
     build_mbtiles_from_raster,
     build_mbtiles_from_cache,
     build_mbtiles_from_xyz,
+    convert_mbtiles,
+    ensure_mbtiles_index,
     find_gdal_tools,
     find_pmtiles_cli,
+    mbtiles_index_status,
     parse_hlg,
     read_pmtiles_header,
+    run_process_streaming,
     tile_range,
     xyz_to_pmtiles,
+    working_space_requirements,
 )
 
 
 class MapBuilderTests(unittest.TestCase):
+    def test_extracts_pmtiles_and_gdal_progress(self):
+        self.assertEqual(33, _extract_progress("33% | 123/456"))
+        self.assertEqual(70, _extract_progress("0...10...20...70..."))
+        self.assertIsNone(_extract_progress("working"))
+
+    def test_streams_child_process_progress(self):
+        events = []
+        lines = []
+        result = run_process_streaming(
+            Path(sys.executable),
+            ["-c", "import sys; sys.stdout.write('33%\\r67%\\r100%\\n'); sys.stdout.flush()"],
+            lines.append,
+            lambda stage, percent: events.append((stage, percent)),
+            "Тест",
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(
+            [("Тест", None), ("Тест", 33), ("Тест", 67), ("Тест", 100)], events
+        )
+        self.assertIn("100%", lines)
+
+    def test_unicode_progress_cannot_orphan_child_process(self):
+        lines = []
+
+        def legacy_console_log(line):
+            line.encode("cp1251")
+            lines.append(line)
+
+        result = run_process_streaming(
+            Path(sys.executable),
+            [
+                "-c",
+                "import sys; sys.stdout.buffer.write('progress: \\u2588 100%\\n'.encode('utf-8'))",
+            ],
+            legacy_console_log,
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertTrue(lines)
+        self.assertNotIn("█", lines[-1])
+
+    def test_large_map_space_recommendations_are_conservative(self):
+        size = 930 * 1024 ** 2
+        mbtiles = working_space_requirements(size, "mbtiles")
+        raster = working_space_requirements(size, "raster")
+        self.assertGreaterEqual(mbtiles["temporary"], 4 * 1024 ** 3)
+        self.assertGreaterEqual(raster["temporary"], 10 * 1024 ** 3)
+        self.assertGreater(raster["temporary"], mbtiles["temporary"])
+
     def test_parse_real_selection_shape(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "selection.hlg"
@@ -134,6 +189,63 @@ class MapBuilderTests(unittest.TestCase):
             self.assertTrue(output.is_file())
             self.assertEqual(3, result["pmtiles"]["version"])
             self.assertEqual(1, result["pmtiles"]["addressed_tiles"])
+
+    def test_large_mbtiles_working_copy_gets_index_and_fast_mode(self):
+        try:
+            cli = find_pmtiles_cli()
+        except FileNotFoundError:
+            self.skipTest("PMTiles CLI is not installed")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_path = root / "without-index.mbtiles"
+            connection = sqlite3.connect(source_path)
+            connection.executescript(
+                """
+                CREATE TABLE metadata (name TEXT, value TEXT);
+                CREATE TABLE tiles (
+                    zoom_level INTEGER, tile_column INTEGER,
+                    tile_row INTEGER, tile_data BLOB
+                );
+                """
+            )
+            connection.executemany(
+                "INSERT INTO metadata VALUES (?, ?)",
+                (("name", "No index"), ("format", "png"), ("scheme", "tms")),
+            )
+            connection.execute(
+                "INSERT INTO tiles VALUES (8, 128, 128, ?)",
+                (b"\x89PNG\r\n\x1a\nmock tile",),
+            )
+            connection.commit()
+            connection.close()
+            self.assertFalse(mbtiles_index_status(source_path)["indexed"])
+
+            working_copy = root / "working.mbtiles"
+            working_copy.write_bytes(source_path.read_bytes())
+            created = ensure_mbtiles_index(working_copy, lambda _: None)
+            self.assertTrue(created["created"])
+            self.assertTrue(mbtiles_index_status(working_copy)["indexed"])
+
+            temp_root = root / "temp"
+            temp_root.mkdir()
+            output = root / "fast.pmtiles"
+            log_lines = []
+            progress_events = []
+            result = convert_mbtiles(
+                source_path,
+                output,
+                cli,
+                log_lines.append,
+                "Large test",
+                "Example",
+                no_deduplication=True,
+                temp_dir=temp_root,
+                progress=lambda stage, percent: progress_events.append((stage, percent)),
+            )
+            self.assertEqual(3, result["version"])
+            self.assertFalse(mbtiles_index_status(source_path)["indexed"])
+            self.assertTrue(any("дедупликация" in line for line in log_lines))
+            self.assertIn(("Копирование MBTiles", 100), progress_events)
 
     def test_converts_real_geotiff_with_gdal_when_available(self):
         try:
