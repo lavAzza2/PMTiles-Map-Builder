@@ -9,7 +9,9 @@ from i18n import (
     detect_system_language,
     get_language,
     load_language,
+    load_settings,
     save_language,
+    save_settings,
     set_language,
     settings_path,
     tr,
@@ -51,8 +53,11 @@ class MapBuilderTests(unittest.TestCase):
     def test_language_setting_is_saved_in_user_profile(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict("os.environ", {"APPDATA": folder}):
+                save_settings({"mode": "xyz", "min_zoom": 8})
                 save_language("en")
                 self.assertEqual("en", load_language())
+                self.assertEqual("xyz", load_settings()["mode"])
+                self.assertEqual(8, load_settings()["min_zoom"])
                 self.assertEqual(Path(folder) / "THS2 Map Builder" / "settings.json", settings_path())
 
     def test_system_language_detection_falls_back_to_english(self):
