@@ -3,7 +3,17 @@ from pathlib import Path
 import sqlite3
 import sys
 import unittest
+from unittest.mock import patch
 
+from i18n import (
+    detect_system_language,
+    get_language,
+    load_language,
+    save_language,
+    set_language,
+    settings_path,
+    tr,
+)
 from map_builder_core import (
     _extract_progress,
     build_mbtiles_from_raster,
@@ -13,6 +23,7 @@ from map_builder_core import (
     ensure_mbtiles_index,
     find_gdal_tools,
     find_pmtiles_cli,
+    format_bytes,
     mbtiles_index_status,
     parse_hlg,
     read_pmtiles_header,
@@ -25,6 +36,32 @@ from map_builder_core import (
 
 
 class MapBuilderTests(unittest.TestCase):
+    def test_russian_and_english_localization(self):
+        original = get_language()
+        try:
+            set_language("en")
+            self.assertEqual("Ready", tr("Готов к работе", "Ready"))
+            self.assertEqual("1.0 GB", format_bytes(1024 ** 3))
+            set_language("ru")
+            self.assertEqual("Готов к работе", tr("Готов к работе", "Ready"))
+            self.assertEqual("1.0 ГБ", format_bytes(1024 ** 3))
+        finally:
+            set_language(original)
+
+    def test_language_setting_is_saved_in_user_profile(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict("os.environ", {"APPDATA": folder}):
+                save_language("en")
+                self.assertEqual("en", load_language())
+                self.assertEqual(Path(folder) / "THS2 Map Builder" / "settings.json", settings_path())
+
+    def test_system_language_detection_falls_back_to_english(self):
+        with patch("i18n.os.name", "posix"):
+            with patch("i18n.locale.getlocale", return_value=("ru_RU", "UTF-8")):
+                self.assertEqual("ru", detect_system_language())
+            with patch("i18n.locale.getlocale", return_value=("de_DE", "UTF-8")):
+                self.assertEqual("en", detect_system_language())
+
     def test_extracts_pmtiles_and_gdal_progress(self):
         self.assertEqual(33, _extract_progress("33% | 123/456"))
         self.assertEqual(70, _extract_progress("0...10...20...70..."))

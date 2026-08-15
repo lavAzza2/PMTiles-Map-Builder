@@ -22,6 +22,7 @@ import tempfile
 import time
 from typing import Callable, Iterable
 
+from i18n import tr
 
 Log = Callable[[str], None]
 Progress = Callable[[str, int | None], None]
@@ -45,8 +46,8 @@ def working_space_requirements(input_size: int, source_type: str) -> dict[str, i
 
 def format_bytes(value: int) -> str:
     if value >= GIB:
-        return f"{value / GIB:.1f} ГБ"
-    return f"{value / 1024 ** 2:.0f} МБ"
+        return tr(f"{value / GIB:.1f} ГБ", f"{value / GIB:.1f} GB")
+    return tr(f"{value / 1024 ** 2:.0f} МБ", f"{value / 1024 ** 2:.0f} MB")
 
 
 def mbtiles_index_status(path: Path) -> dict[str, object]:
@@ -57,7 +58,7 @@ def mbtiles_index_status(path: Path) -> dict[str, object]:
             "SELECT type FROM sqlite_master WHERE name = 'tiles'"
         ).fetchone()
         if not object_row:
-            raise ValueError("В MBTiles не найдена таблица или представление tiles.")
+            raise ValueError(tr("В MBTiles не найдена таблица или представление tiles.", "The MBTiles file has no tiles table or view."))
         table = "tiles" if object_row[0] == "table" else "map"
         columns = {
             row[1] for row in connection.execute(f"PRAGMA table_info('{table}')")
@@ -82,15 +83,15 @@ def ensure_mbtiles_index(path: Path, log: Log = print) -> dict[str, object]:
     """Create a performance index in a writable working copy, never in source."""
     status = mbtiles_index_status(path)
     if status["indexed"]:
-        log("Индекс тайлов найден.")
+        log(tr("Индекс тайлов найден.", "Tile index found."))
         return status
     if not status["can_create"]:
-        log("Структура MBTiles нестандартная; автоматический индекс создать нельзя.")
+        log(tr("Структура MBTiles нестандартная; автоматический индекс создать нельзя.", "The MBTiles structure is non-standard; an index cannot be created automatically."))
         return status
     table = str(status["table"])
     connection = sqlite3.connect(path)
     try:
-        log(f"Создаю индекс {table}(zoom_level, tile_column, tile_row)…")
+        log(tr(f"Создаю индекс {table}(zoom_level, tile_column, tile_row)…", f"Creating {table}(zoom_level, tile_column, tile_row) index…"))
         connection.execute(
             f"CREATE INDEX IF NOT EXISTS ths2_tiles_zxy_idx "
             f"ON {table}(zoom_level, tile_column, tile_row)"
@@ -100,7 +101,7 @@ def ensure_mbtiles_index(path: Path, log: Log = print) -> dict[str, object]:
         connection.close()
     status["indexed"] = True
     status["created"] = True
-    log("Индекс рабочей копии создан.")
+    log(tr("Индекс рабочей копии создан.", "Working-copy index created."))
     return status
 
 
@@ -114,17 +115,19 @@ def copy_file_with_progress(
     copied = 0
     started = time.monotonic()
     if progress:
-        progress("Копирование MBTiles", 0)
+        progress(tr("Копирование MBTiles", "Copying MBTiles"), 0)
     with source.open("rb") as reader, destination.open("wb") as writer:
         while chunk := reader.read(8 * 1024 * 1024):
             writer.write(chunk)
             copied += len(chunk)
             if progress and total:
-                progress("Копирование MBTiles", min(100, copied * 100 // total))
+                progress(tr("Копирование MBTiles", "Copying MBTiles"), min(100, copied * 100 // total))
     elapsed = max(0.01, time.monotonic() - started)
     log(
-        f"Рабочая копия создана: {format_bytes(total)} за {elapsed:.1f} с "
-        f"({format_bytes(int(total / elapsed))}/с)."
+        tr(
+            f"Рабочая копия создана: {format_bytes(total)} за {elapsed:.1f} с ({format_bytes(int(total / elapsed))}/с).",
+            f"Working copy created: {format_bytes(total)} in {elapsed:.1f} s ({format_bytes(int(total / elapsed))}/s).",
+        )
     )
 
 
@@ -134,7 +137,7 @@ def parse_hlg(path: Path) -> dict:
     with path.open("r", encoding="utf-8-sig") as stream:
         parser.read_file(stream)
     if "HIGHLIGHTING" not in parser:
-        raise ValueError("В файле нет секции [HIGHLIGHTING].")
+        raise ValueError(tr("В файле нет секции [HIGHLIGHTING].", "The file has no [HIGHLIGHTING] section."))
     section = parser["HIGHLIGHTING"]
     points: list[tuple[float, float]] = []
     index = 1
@@ -144,7 +147,7 @@ def parse_hlg(path: Path) -> dict:
         )
         index += 1
     if len(points) < 3:
-        raise ValueError("В выделении должно быть не меньше трёх точек.")
+        raise ValueError(tr("В выделении должно быть не меньше трёх точек.", "The selection must contain at least three points."))
     lons = [point[0] for point in points]
     lats = [point[1] for point in points]
     bbox = (min(lons), min(lats), max(lons), max(lats))
@@ -167,7 +170,7 @@ def lat_to_y(lat: float, zoom: int) -> int:
 def tile_range(bbox: tuple[float, float, float, float], zoom: int) -> tuple[int, int, int, int]:
     west, south, east, north = bbox
     if west > east:
-        raise ValueError("Области через линию 180° пока не поддерживаются.")
+        raise ValueError(tr("Области через линию 180° пока не поддерживаются.", "Areas crossing the 180° meridian are not supported yet."))
     return (
         lon_to_x(west, zoom),
         lon_to_x(east, zoom),
@@ -212,7 +215,7 @@ def detect_tile_format(blob: bytes) -> str:
         b"avis",
     }:
         return "avif"
-    raise ValueError("В кэше найден неподдерживаемый формат тайла.")
+    raise ValueError(tr("В кэше найден неподдерживаемый формат тайла.", "An unsupported tile format was found in the cache."))
 
 
 def x_to_lon(x: int, zoom: int) -> float:
@@ -311,10 +314,10 @@ def scan_xyz_directory(
 ) -> dict[str, object]:
     """Count an XYZ tree without retaining a potentially huge file manifest."""
     if not tiles_root.is_dir():
-        raise FileNotFoundError(f"Не найдена папка тайлов: {tiles_root}")
+        raise FileNotFoundError(tr(f"Не найдена папка тайлов: {tiles_root}", f"Tile folder not found: {tiles_root}"))
     zoom_folders = _xyz_zoom_folders(tiles_root)
     if not zoom_folders:
-        raise ValueError("Не найдены папки масштабов XYZ. Поддерживаются имена 13 или z13.")
+        raise ValueError(tr("Не найдены папки масштабов XYZ. Поддерживаются имена 13 или z13.", "No XYZ zoom folders found. Folder names such as 13 or z13 are supported."))
 
     total_tiles = 0
     total_bytes = 0
@@ -322,7 +325,7 @@ def scan_xyz_directory(
     started = time.monotonic()
     last_update = started
     if progress:
-        progress("Поиск тайлов XYZ — 0 найдено", None)
+        progress(tr("Поиск тайлов XYZ — 0 найдено", "Scanning XYZ tiles — 0 found"), None)
     for index, (zoom, zoom_folder) in enumerate(zoom_folders, start=1):
         zoom_count = 0
         zoom_bytes = 0
@@ -331,11 +334,11 @@ def scan_xyz_directory(
             try:
                 zoom_bytes += tile_path.stat().st_size
             except OSError as error:
-                raise OSError(f"Не удалось прочитать сведения о тайле {tile_path}: {error}") from error
+                raise OSError(tr(f"Не удалось прочитать сведения о тайле {tile_path}: {error}", f"Could not read tile information for {tile_path}: {error}")) from error
             now = time.monotonic()
             if progress and (zoom_count % 1000 == 0 or now - last_update >= 0.5):
                 progress(
-                    f"Поиск тайлов XYZ — найдено {total_tiles + zoom_count:,}",
+                    tr(f"Поиск тайлов XYZ — найдено {total_tiles + zoom_count:,}", f"Scanning XYZ tiles — {total_tiles + zoom_count:,} found"),
                     None,
                 )
                 last_update = now
@@ -343,23 +346,23 @@ def scan_xyz_directory(
             per_zoom[zoom] = zoom_count
             total_tiles += zoom_count
             total_bytes += zoom_bytes
-        log(f"Поиск XYZ, масштаб {zoom}: {zoom_count} тайлов, {format_bytes(zoom_bytes)}.")
+        log(tr(f"Поиск XYZ, масштаб {zoom}: {zoom_count} тайлов, {format_bytes(zoom_bytes)}.", f"XYZ scan, zoom {zoom}: {zoom_count} tiles, {format_bytes(zoom_bytes)}."))
         if progress:
             progress(
-                f"Поиск тайлов XYZ — найдено {total_tiles:,}",
+                tr(f"Поиск тайлов XYZ — найдено {total_tiles:,}", f"Scanning XYZ tiles — {total_tiles:,} found"),
                 None if index < len(zoom_folders) else 100,
             )
 
     if not total_tiles:
-        raise ValueError(
-            "В папке не найдены тайлы со структурой z/x/y.png или "
-            "zZ/xX/yY.png (также поддерживаются jpg/webp/avif)."
-        )
+        raise ValueError(tr(
+            "В папке не найдены тайлы со структурой z/x/y.png или zZ/xX/yY.png (также поддерживаются jpg/webp/avif).",
+            "No tiles with a z/x/y.png or zZ/xX/yY.png structure were found (jpg/webp/avif are also supported).",
+        ))
     elapsed = max(0.01, time.monotonic() - started)
-    log(
-        f"Поиск XYZ завершён: {total_tiles:,} тайлов, {format_bytes(total_bytes)} "
-        f"за {elapsed:.1f} с."
-    )
+    log(tr(
+        f"Поиск XYZ завершён: {total_tiles:,} тайлов, {format_bytes(total_bytes)} за {elapsed:.1f} с.",
+        f"XYZ scan completed: {total_tiles:,} tiles, {format_bytes(total_bytes)} in {elapsed:.1f} s.",
+    ))
     return {
         "tiles": total_tiles,
         "bytes": total_bytes,
@@ -379,7 +382,7 @@ def build_mbtiles_from_xyz(
 ) -> dict:
     """Build MBTiles from a read-only XYZ directory laid out as z/x/y.ext."""
     if not tiles_root.is_dir():
-        raise FileNotFoundError(f"Не найдена папка тайлов: {tiles_root}")
+        raise FileNotFoundError(tr(f"Не найдена папка тайлов: {tiles_root}", f"Tile folder not found: {tiles_root}"))
     scan_result = scan_result or scan_xyz_directory(tiles_root, log, progress)
     total_tiles = int(scan_result["tiles"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -397,7 +400,7 @@ def build_mbtiles_from_xyz(
         last_update = 0.0
         build_started = time.monotonic()
         if progress:
-            progress(f"Сборка XYZ — 0/{total_tiles:,} тайлов", 0)
+            progress(tr(f"Сборка XYZ — 0/{total_tiles:,} тайлов", f"Building XYZ — 0/{total_tiles:,} tiles"), 0)
         for zoom, zoom_folder in zoom_folders:
             limit = 1 << zoom
             zoom_count = 0
@@ -407,14 +410,14 @@ def build_mbtiles_from_xyz(
                 try:
                     current_format = detect_tile_format(blob)
                 except ValueError as error:
-                    raise ValueError(f"Неподдерживаемый или повреждённый тайл: {tile_path}") from error
+                    raise ValueError(tr(f"Неподдерживаемый или повреждённый тайл: {tile_path}", f"Unsupported or corrupted tile: {tile_path}")) from error
                 if tile_format is None:
                     tile_format = current_format
                 elif current_format != tile_format:
-                    raise ValueError(
-                        "В папке смешаны форматы тайлов. Оставь только один: "
-                        "PNG, JPEG, WebP или AVIF."
-                    )
+                    raise ValueError(tr(
+                        "В папке смешаны форматы тайлов. Оставь только один: PNG, JPEG, WebP или AVIF.",
+                        "The folder contains mixed tile formats. Keep only one: PNG, JPEG, WebP or AVIF.",
+                    ))
                 target.execute(
                     "INSERT OR REPLACE INTO tiles VALUES (?, ?, ?, ?)",
                     (zoom, x, limit - 1 - y, blob),
@@ -432,8 +435,10 @@ def build_mbtiles_from_xyz(
                     speed = processed / elapsed
                     remaining = int((total_tiles - processed) / speed) if speed else 0
                     progress(
-                        f"Сборка XYZ — {processed:,}/{total_tiles:,} · "
-                        f"{speed:,.0f} тайл/с · осталось {remaining // 60:02d}:{remaining % 60:02d}",
+                        tr(
+                            f"Сборка XYZ — {processed:,}/{total_tiles:,} · {speed:,.0f} тайл/с · осталось {remaining // 60:02d}:{remaining % 60:02d}",
+                            f"Building XYZ — {processed:,}/{total_tiles:,} · {speed:,.0f} tiles/s · {remaining // 60:02d}:{remaining % 60:02d} remaining",
+                        ),
                         percent,
                     )
                     last_percent = percent
@@ -442,16 +447,16 @@ def build_mbtiles_from_xyz(
                 zoom_bounds[zoom] = bounds
                 inserted += zoom_count
                 target.commit()
-            log(f"Масштаб {zoom}: добавлено {zoom_count} тайлов.")
+            log(tr(f"Масштаб {zoom}: добавлено {zoom_count} тайлов.", f"Zoom {zoom}: added {zoom_count} tiles."))
 
         if not inserted or tile_format is None:
-            raise ValueError("В папке не найдены тайлы со структурой z/x/y.png (или jpg/webp/avif).")
+            raise ValueError(tr("В папке не найдены тайлы со структурой z/x/y.png (или jpg/webp/avif).", "No tiles with a z/x/y.png structure were found (jpg/webp/avif are also supported)."))
         stored_tiles = int(target.execute("SELECT COUNT(*) FROM tiles").fetchone()[0])
         if stored_tiles != total_tiles:
-            raise ValueError(
-                f"Обнаружены повторяющиеся координаты XYZ: найдено файлов {total_tiles:,}, "
-                f"уникальных тайлов {stored_tiles:,}. Удали дубликаты и повтори преобразование."
-            )
+            raise ValueError(tr(
+                f"Обнаружены повторяющиеся координаты XYZ: найдено файлов {total_tiles:,}, уникальных тайлов {stored_tiles:,}. Удали дубликаты и повтори преобразование.",
+                f"Duplicate XYZ coordinates detected: {total_tiles:,} files found but only {stored_tiles:,} unique tiles. Remove duplicates and try again.",
+            ))
         min_zoom = min(zoom_bounds)
         max_zoom = max(zoom_bounds)
         boxes = [
@@ -481,7 +486,7 @@ def build_mbtiles_from_xyz(
         )
         target.commit()
         if progress:
-            progress(f"Сборка XYZ — {inserted:,}/{total_tiles:,} тайлов", 100)
+            progress(tr(f"Сборка XYZ — {inserted:,}/{total_tiles:,} тайлов", f"Building XYZ — {inserted:,}/{total_tiles:,} tiles"), 100)
     except Exception:
         target.close()
         if output_path.exists():
@@ -523,7 +528,7 @@ def build_mbtiles_from_cache(
     progress: Progress | None = None,
 ) -> dict:
     if not cache_root.is_dir():
-        raise FileNotFoundError(f"Не найдена папка кэша: {cache_root}")
+        raise FileNotFoundError(tr(f"Не найдена папка кэша: {cache_root}", f"Cache folder not found: {cache_root}"))
     selection = parse_hlg(selection_path)
     bbox = selection["bbox"]
     expected = expected_tiles(bbox, min_zoom, max_zoom)
@@ -573,10 +578,10 @@ def build_mbtiles_from_cache(
                         if tile_format is None:
                             tile_format = current_format
                         elif current_format != tile_format:
-                            raise ValueError(
-                                "В выбранной области смешаны форматы тайлов; "
-                                "собери карту из одного источника."
-                            )
+                            raise ValueError(tr(
+                                "В выбранной области смешаны форматы тайлов; собери карту из одного источника.",
+                                "The selected area contains mixed tile formats; build the map from a single source.",
+                            ))
                         tms_y = (1 << zoom) - 1 - xyz_y
                         target.execute(
                             "INSERT OR REPLACE INTO tiles VALUES (?, ?, ?, ?)",
@@ -584,16 +589,16 @@ def build_mbtiles_from_cache(
                         )
                         zoom_count += 1
             inserted += zoom_count
-            log(f"Масштаб {zoom}: найдено {zoom_count} тайлов.")
+            log(tr(f"Масштаб {zoom}: найдено {zoom_count} тайлов.", f"Zoom {zoom}: found {zoom_count} tiles."))
             if progress:
                 progress(
-                    "Чтение кэша SAS.Planet",
+                    tr("Чтение кэша SAS.Planet", "Reading SAS.Planet cache"),
                     (zoom - min_zoom + 1) * 100 // (max_zoom - min_zoom + 1),
                 )
             target.commit()
 
         if inserted == 0 or tile_format is None:
-            raise ValueError("В выделенной области и диапазоне масштабов тайлы не найдены.")
+            raise ValueError(tr("В выделенной области и диапазоне масштабов тайлы не найдены.", "No tiles were found in the selected area and zoom range."))
         west, south, east, north = bbox
         metadata = {
             "name": name or output_path.stem,
@@ -644,10 +649,10 @@ def find_pmtiles_cli(explicit_path: str | None = None) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise FileNotFoundError(
-        "Не найден официальный PMTiles CLI. Запусти Install-PmTiles.ps1 "
-        "из папки THS2 Map Builder."
-    )
+    raise FileNotFoundError(tr(
+        "Не найден официальный PMTiles CLI. Запусти Install-PmTiles.ps1 из папки THS2 Map Builder.",
+        "The official PMTiles CLI was not found. Run Install-PmTiles.ps1 from the THS2 Map Builder folder.",
+    ))
 
 
 def _extract_progress(text: str) -> int | None:
@@ -675,11 +680,12 @@ def run_process_streaming(
     arguments: list[str],
     log: Log = print,
     progress: Progress | None = None,
-    stage: str = "Обработка",
+    stage: str | None = None,
     env: dict[str, str] | None = None,
     emit_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run a hidden child process while streaming CR/LF progress to the GUI."""
+    stage = stage or tr("Обработка", "Processing")
     command = [str(executable), *arguments]
     if progress:
         progress(stage, None)
@@ -743,7 +749,7 @@ def run_pmtiles(
     if check and result.returncode != 0:
         tail = result.stdout.strip()[-1000:]
         raise RuntimeError(
-            f"PMTiles CLI завершился с кодом {result.returncode}."
+            tr(f"PMTiles CLI завершился с кодом {result.returncode}.", f"PMTiles CLI exited with code {result.returncode}.")
             + (f"\n{tail}" if tail else "")
         )
     return result
@@ -783,11 +789,10 @@ def find_gdal_tools(explicit_folder: str | None = None) -> dict[str, Path]:
                 result[name] = Path(found)
     missing = [name for name in names if name not in result]
     if missing:
-        raise FileNotFoundError(
-            "Для GeoTIFF и KMZ нужен GDAL. Установи OSGeo4W/QGIS или положи "
-            "утилиты GDAL в папку bin\\gdal рядом с приложением. Не найдены: "
-            + ", ".join(missing)
-        )
+        raise FileNotFoundError(tr(
+            "Для GeoTIFF и KMZ нужен GDAL. Установи OSGeo4W/QGIS или положи утилиты GDAL в папку bin\\gdal рядом с приложением. Не найдены: " + ", ".join(missing),
+            "GeoTIFF and KMZ require GDAL. Install OSGeo4W/QGIS or place the GDAL tools in bin\\gdal next to the application. Missing: " + ", ".join(missing),
+        ))
     return result
 
 
@@ -807,9 +812,10 @@ def run_external(
     if result.returncode != 0:
         tail = result.stdout.strip()[-1000:]
         raise RuntimeError(
-            f"{executable.name} завершился с кодом {result.returncode}. "
-            "Проверь географическую привязку исходного файла."
-            + (f"\n{tail}" if tail else "")
+            tr(
+                f"{executable.name} завершился с кодом {result.returncode}. Проверь географическую привязку исходного файла.",
+                f"{executable.name} exited with code {result.returncode}. Check the source file georeferencing.",
+            ) + (f"\n{tail}" if tail else "")
         )
     return result
 
@@ -830,14 +836,14 @@ def build_mbtiles_from_raster(
 ) -> dict:
     """Reproject a GeoTIFF/KMZ raster to Web Mercator and create MBTiles."""
     if not input_path.is_file():
-        raise FileNotFoundError(f"Не найден исходный растр: {input_path}")
+        raise FileNotFoundError(tr(f"Не найден исходный растр: {input_path}", f"Source raster not found: {input_path}"))
     if not 0 <= min_zoom <= max_zoom <= 22:
-        raise ValueError("Для георастра масштабы должны быть в диапазоне 0–22.")
+        raise ValueError(tr("Для георастра масштабы должны быть в диапазоне 0–22.", "Raster zoom levels must be between 0 and 22."))
     tile_format = tile_format.upper()
     if tile_format not in {"PNG", "JPEG"}:
-        raise ValueError("Для георастра доступны тайлы PNG или JPEG.")
+        raise ValueError(tr("Для георастра доступны тайлы PNG или JPEG.", "Raster tiles must use PNG or JPEG."))
     if not 1 <= jpeg_quality <= 100:
-        raise ValueError("Качество JPEG должно быть от 1 до 100.")
+        raise ValueError(tr("Качество JPEG должно быть от 1 до 100.", "JPEG quality must be between 1 and 100."))
 
     tools = find_gdal_tools(gdal_folder)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -845,17 +851,17 @@ def build_mbtiles_from_raster(
         output_path.unlink()
     info = run_external(
         tools["gdalinfo"], ["-json", str(input_path)], log, emit_output=False,
-        progress=progress, stage="Проверка геопривязки"
+        progress=progress, stage=tr("Проверка геопривязки", "Checking georeferencing")
     )
     try:
         info_payload = json.loads(info.stdout)
     except json.JSONDecodeError as error:
-        raise ValueError("GDAL не смог прочитать сведения о геопривязке.") from error
+        raise ValueError(tr("GDAL не смог прочитать сведения о геопривязке.", "GDAL could not read the georeferencing information.")) from error
     if not info_payload.get("coordinateSystem") and not info_payload.get("gcps"):
-        raise ValueError(
-            "У растра не найдена система координат. Для обычного JPG/PNG сначала "
-            "нужно выполнить географическую привязку."
-        )
+        raise ValueError(tr(
+            "У растра не найдена система координат. Для обычного JPG/PNG сначала нужно выполнить географическую привязку.",
+            "The raster has no coordinate reference system. A regular JPG/PNG must be georeferenced first.",
+        ))
 
     resolution = 156543.03392804097 / (1 << max_zoom)
     with tempfile.TemporaryDirectory(
@@ -871,10 +877,10 @@ def build_mbtiles_from_raster(
         if tile_format == "PNG":
             warp_arguments.append("-dstalpha")
         warp_arguments.extend((str(input_path), str(warped)))
-        log(f"Перепроецирование в Web Mercator, максимальный масштаб {max_zoom}…")
+        log(tr(f"Перепроецирование в Web Mercator, максимальный масштаб {max_zoom}…", f"Reprojecting to Web Mercator, maximum zoom {max_zoom}…"))
         run_external(
             tools["gdalwarp"], warp_arguments, log, progress=progress,
-            stage="Перепроецирование"
+            stage=tr("Перепроецирование", "Reprojecting")
         )
 
         translate_arguments = [
@@ -885,21 +891,21 @@ def build_mbtiles_from_raster(
         if tile_format == "JPEG":
             translate_arguments.extend(("-co", f"QUALITY={jpeg_quality}"))
         translate_arguments.extend((str(warped), str(output_path)))
-        log("Нарезка растра на тайлы…")
+        log(tr("Нарезка растра на тайлы…", "Creating raster tiles…"))
         run_external(
             tools["gdal_translate"], translate_arguments, log, progress=progress,
-            stage="Нарезка тайлов"
+            stage=tr("Нарезка тайлов", "Creating tiles")
         )
 
         if min_zoom < max_zoom:
             overview_factors = [str(1 << step) for step in range(1, max_zoom - min_zoom + 1)]
-            log(f"Создание масштабов {min_zoom}–{max_zoom}…")
+            log(tr(f"Создание масштабов {min_zoom}–{max_zoom}…", f"Creating zoom levels {min_zoom}–{max_zoom}…"))
             run_external(
                 tools["gdaladdo"],
                 ["-r", "average", str(output_path), *overview_factors],
                 log,
                 progress=progress,
-                stage="Создание масштабов",
+                stage=tr("Создание масштабов", "Creating zoom levels"),
             )
 
     connection = sqlite3.connect(output_path)
@@ -908,7 +914,7 @@ def build_mbtiles_from_raster(
             "SELECT MIN(zoom_level), MAX(zoom_level), COUNT(*) FROM tiles"
         ).fetchone()
         if not zoom_row or zoom_row[2] == 0:
-            raise ValueError("GDAL не создал ни одного тайла.")
+            raise ValueError(tr("GDAL не создал ни одного тайла.", "GDAL did not create any tiles."))
         actual_min, actual_max, tile_count = zoom_row
         first_blob = connection.execute("SELECT tile_data FROM tiles LIMIT 1").fetchone()[0]
         detected_format = detect_tile_format(first_blob)
@@ -952,7 +958,7 @@ def convert_mbtiles(
     progress: Progress | None = None,
 ) -> dict:
     if not input_path.is_file():
-        raise FileNotFoundError(f"Не найден MBTiles: {input_path}")
+        raise FileNotFoundError(tr(f"Не найден MBTiles: {input_path}", f"MBTiles file not found: {input_path}"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
@@ -979,29 +985,29 @@ def convert_mbtiles(
         finally:
             metadata_connection.close()
         if progress:
-            progress("Индексирование MBTiles", None)
+            progress(tr("Индексирование MBTiles", "Indexing MBTiles"), None)
         ensure_mbtiles_index(conversion_input, log)
         if progress:
-            progress("Индексирование MBTiles", 100)
+            progress(tr("Индексирование MBTiles", "Indexing MBTiles"), 100)
     else:
-        log("Индекс исходного MBTiles найден; дополнительная копия не требуется.")
+        log(tr("Индекс исходного MBTiles найден; дополнительная копия не требуется.", "The source MBTiles index was found; no additional copy is required."))
     try:
         arguments = ["convert"]
         if no_deduplication:
             arguments.append("--no-deduplication")
-            log("Быстрый режим: дедупликация тайлов отключена.")
+            log(tr("Быстрый режим: дедупликация тайлов отключена.", "Fast mode: tile deduplication is disabled."))
         if temp_dir:
             arguments.extend(("--tmpdir", str(temp_dir)))
         arguments.extend((str(conversion_input), str(output_path)))
         run_pmtiles(
-            cli, arguments, log, progress=progress, stage="Упаковка PMTiles"
+            cli, arguments, log, progress=progress, stage=tr("Упаковка PMTiles", "Packing PMTiles")
         )
     finally:
         if temporary is not None:
             temporary.cleanup()
     run_pmtiles(
         cli, ["verify", str(output_path)], log, progress=progress,
-        stage="Проверка PMTiles"
+        stage=tr("Проверка PMTiles", "Verifying PMTiles")
     )
     return read_pmtiles_header(output_path)
 
@@ -1010,7 +1016,7 @@ def read_pmtiles_header(path: Path) -> dict:
     with path.open("rb") as stream:
         header = stream.read(127)
     if len(header) != 127 or header[:7] != b"PMTiles" or header[7] != 3:
-        raise ValueError("Файл не является PMTiles v3.")
+        raise ValueError(tr("Файл не является PMTiles v3.", "The file is not PMTiles v3."))
     values = struct.unpack_from("<11Q", header, 8)
     return {
         "version": header[7],
@@ -1092,24 +1098,23 @@ def xyz_to_pmtiles(
     temp_free = shutil.disk_usage(temp_root).free
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_free = shutil.disk_usage(output_path.parent).free
-    log(
-        f"Оценка места для XYZ: исходные тайлы {format_bytes(source_size)}, "
-        f"свободно во временной папке {format_bytes(temp_free)}, "
-        f"в папке результата {format_bytes(output_free)}."
-    )
+    log(tr(
+        f"Оценка места для XYZ: исходные тайлы {format_bytes(source_size)}, свободно во временной папке {format_bytes(temp_free)}, в папке результата {format_bytes(output_free)}.",
+        f"XYZ space estimate: source tiles {format_bytes(source_size)}, temporary folder free {format_bytes(temp_free)}, output folder free {format_bytes(output_free)}.",
+    ))
     minimum_temp = source_size + max(256 * 1024 ** 2, source_size // 5)
     minimum_output = max(128 * 1024 ** 2, source_size // 2)
     same_drive = temp_root.resolve().anchor.lower() == output_path.parent.resolve().anchor.lower()
     if same_drive:
         if temp_free < minimum_temp + minimum_output:
-            raise OSError("Недостаточно свободного места для временного MBTiles и результата XYZ.")
+            raise OSError(tr("Недостаточно свободного места для временного MBTiles и результата XYZ.", "Not enough free space for the temporary MBTiles and XYZ output."))
     elif temp_free < minimum_temp or output_free < minimum_output:
-        raise OSError("Недостаточно свободного места для преобразования XYZ.")
+        raise OSError(tr("Недостаточно свободного места для преобразования XYZ.", "Not enough free space for XYZ conversion."))
     if temp_free < requirements["temporary"] or output_free < requirements["output"]:
-        log(
-            "ВНИМАНИЕ: свободного места меньше рекомендуемого; преобразование будет "
-            "продолжено, так как обязательный минимум доступен."
-        )
+        log(tr(
+            "ВНИМАНИЕ: свободного места меньше рекомендуемого; преобразование будет продолжено, так как обязательный минимум доступен.",
+            "WARNING: free space is below the recommendation; conversion will continue because the required minimum is available.",
+        ))
     with tempfile.TemporaryDirectory(
         prefix="ths2-map-builder-xyz-", dir=str(temp_dir) if temp_dir else None
     ) as temp_folder:
