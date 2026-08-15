@@ -4,6 +4,10 @@
 [![PMTiles](https://img.shields.io/badge/PMTiles-v3-5B4BDB)](https://github.com/protomaps/PMTiles)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+[Русский](#русский) · [English](#english)
+
+## Русский
+
 Простое Windows-приложение для подготовки растровых офлайн-карт для
 Android-приложения THS2. Помощник принимает кэш SAS.Planet, MBTiles,
 геопривязанные GeoTIFF/KMZ и папки тайлов XYZ, приводит источник к единому
@@ -222,3 +226,162 @@ python -m unittest -v test_map_builder.py
 
 Исходный код распространяется по лицензии [MIT](LICENSE). Компоненты готовой
 Windows-сборки перечислены в [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
+## English
+
+THS2 Map Builder is a Windows desktop application for creating verified raster
+PMTiles v3 offline maps for the [THS2 Android app](https://github.com/lavAzza2/THS2).
+It converts SAS.Planet cache data, MBTiles archives, XYZ tile directories, and
+georeferenced GeoTIFF/KMZ rasters into a format that THS2 can open directly.
+
+The application runs **next to an unmodified SAS.Planet installation**. It is
+not a SAS.Planet fork or plugin, does not interfere with tile downloads, and
+never modifies the original SAS.Planet cache or XYZ source directory.
+
+### Highlights
+
+- modern dark Windows interface;
+- separate tabs for SAS.Planet, MBTiles, XYZ, and GeoTIFF/KMZ workflows;
+- Russian and English UI with automatic Windows-language detection;
+- language override under **Settings** without restarting the application;
+- automatic restoration of the last tab, paths, zoom levels, and conversion options;
+- direct read-only access to SAS.Planet SQLite CacheType=71;
+- raster PNG, JPEG, WebP, and AVIF tile support;
+- live conversion progress, elapsed time, XYZ tile count, speed, and ETA;
+- free-space preflight checks and a selectable temporary directory;
+- fast mode for very large maps using PMTiles `--no-deduplication`;
+- PMTiles v3 verification with the official PMTiles CLI;
+- `.report.json` and `.diagnostic.log` files next to the output map.
+
+### Download and install
+
+1. Open the [latest release](https://github.com/lavAzza2/PMTiles-Map-Builder/releases/latest).
+2. Download `THS2-Map-Builder-Windows-x64-vX.Y.Z.zip`.
+3. Extract the complete archive to a folder.
+4. Run `THS2 Map Builder.exe`.
+
+Do not move only the EXE out of the extracted folder. The adjacent `_internal`
+directory contains Python, Tcl/Tk, and the official `pmtiles.exe`. Python does
+not need to be installed for the packaged application.
+
+### Recommended SAS.Planet workflow
+
+1. Select a map source in SAS.Planet.
+2. Select a rectangle or polygon.
+3. Download all required zoom levels.
+4. Open THS2 Map Builder and select the **SAS.Planet** tab.
+5. Choose the source folder inside `cache_sqlite` and the `LastSelection.hlg` file.
+6. Enter standard XYZ/PMTiles zoom levels. SAS.Planet historically displays
+   these levels one number higher.
+7. Enter a map name, source attribution, and output file.
+8. Select a temporary folder with sufficient free space for a large map.
+9. Click **Create THS2 map**.
+
+The source `.sqlitedb` files are opened through SQLite `mode=ro`. The converter
+creates all intermediate databases in a separate temporary directory.
+
+### Supported inputs
+
+#### SAS.Planet CacheType=71
+
+Direct conversion reads the fragmented SQLite cache selected by
+`LastSelection.hlg`. Missing tiles are reported after the map is created.
+
+#### MBTiles
+
+Existing raster MBTiles files can be converted directly. If a large source
+lacks the required `zoom_level, tile_column, tile_row` index, the application
+creates the index only in a temporary working copy and leaves the source file
+unchanged.
+
+#### XYZ tile directories
+
+Both common naming layouts are supported:
+
+```text
+tiles/13/5424/2568.jpg
+tiles/z13/x5424/y2568.jpg
+```
+
+Zoom levels and bounds are detected automatically. XYZ Y coordinates are
+converted to TMS row numbers for the temporary MBTiles database. All tiles in
+one map must use the same image format.
+
+#### GeoTIFF and KMZ
+
+Georeferenced `.tif`, `.tiff`, and `.kmz` rasters can be reprojected to Web
+Mercator and tiled as PNG or JPEG. This mode requires GDAL from OSGeo4W or QGIS.
+Plain JPG/PNG images without georeferencing are not supported.
+
+### Large maps
+
+For sources around 1 GB or larger:
+
+- choose a temporary directory on a drive with several gigabytes of free space;
+- enable **Fast mode** for satellite imagery when a slightly larger PMTiles file
+  is acceptable;
+- follow the displayed stage, percentage, elapsed time, and ETA;
+- if conversion fails or appears stalled, share the generated
+  `.diagnostic.log` file. It contains tool output, but not the tile images.
+
+### Language and saved settings
+
+On first launch, Russian Windows installations use Russian; all other system
+languages use English. Use the **Settings** button in the upper-right corner to
+change the language manually.
+
+The application automatically saves the selected converter tab, source paths,
+output path, map name, attribution, zoom levels, raster settings, temporary
+directory, fast mode, and language. Preferences are stored in:
+
+```text
+%APPDATA%\THS2 Map Builder\settings.json
+```
+
+### Running from source
+
+Requirements: Windows 10/11 and Python 3.10 or newer. GeoTIFF/KMZ conversion
+also requires GDAL.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-PmTiles.ps1
+python .\ths2_map_builder.pyw
+```
+
+### Building the Windows package
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-PmTiles.ps1
+powershell -ExecutionPolicy Bypass -File .\Build-Windows-App.ps1
+```
+
+The standalone package is written to `dist\THS2 Map Builder`.
+
+### Tests
+
+```powershell
+python -m unittest -v test_map_builder.py
+```
+
+### Current limitations
+
+- direct SAS.Planet access currently supports CacheType=71 only;
+- selections crossing the antimeridian are not supported;
+- the application does not download missing tiles;
+- vector SHP, GeoJSON, and KML data is not rendered to raster tiles;
+- the compact Windows package does not bundle GDAL;
+- automatic monitoring of an MBTiles export folder is not implemented.
+
+### Attribution and map-source rights
+
+Only convert and distribute map data when the source license permits it. Enter
+the required copyright notice and usage terms in the **Attribution** field; the
+text is embedded in PMTiles metadata.
+
+### License
+
+Source code is available under the [MIT License](LICENSE). Third-party
+components included in the Windows package are documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
