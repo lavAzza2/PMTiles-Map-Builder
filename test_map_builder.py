@@ -1,9 +1,11 @@
 import tempfile
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import unittest
 from unittest.mock import patch
+import zipfile
 
 from i18n import (
     detect_system_language,
@@ -20,6 +22,7 @@ from map_builder_core import (
     _extract_progress,
     build_mbtiles_from_raster,
     build_mbtiles_from_cache,
+    build_mbtiles_from_global_mapper_zip,
     build_mbtiles_from_xyz,
     convert_mbtiles,
     ensure_mbtiles_index,
@@ -30,11 +33,25 @@ from map_builder_core import (
     parse_hlg,
     read_pmtiles_header,
     run_process_streaming,
+    scan_global_mapper_zip,
     scan_xyz_directory,
     tile_range,
     xyz_to_pmtiles,
     working_space_requirements,
 )
+
+
+def write_global_mapper_zip(path: Path, *, xml: bytes | None = None) -> None:
+    metadata = xml or (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<MapSource creator="Global Mapper">'
+        b'<NativeProj>EPSG:3857</NativeProj><TileSize>256</TileSize>'
+        b'<BaseURL>tiles/Z%z/%y/%x.png</BaseURL>'
+        b'</MapSource>'
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("0-36 РККА-30 г/036.gm_source_def.xml", metadata)
+        archive.writestr("0-36 РККА-30 г/Z1/0/1.png", b"\x89PNG\r\n\x1a\nmock tile")
 
 
 class MapBuilderTests(unittest.TestCase):
@@ -233,6 +250,149 @@ class MapBuilderTests(unittest.TestCase):
             self.assertEqual(0, build_events[0][1])
             self.assertEqual(100, build_events[-1][1])
             self.assertTrue(any("2/2" in stage for stage, _ in build_events))
+
+    def test_builds_global_mapper_zip_with_y_x_swapped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive_path = root / "global-mapper.zip"
+            write_global_mapper_zip(archive_path)
+            scan = scan_global_mapper_zip(archive_path, lambda _: None)
+            self.assertEqual("global-mapper-z-y-x", scan["layout"])
+            self.assertEqual({1: 1}, scan["zooms"])
+
+            output = root / "global-mapper.mbtiles"
+            result = build_mbtiles_from_global_mapper_zip(
+                archive_path,
+                output,
+                "Global Mapper test",
+                "Example",
+                lambda _: None,
+                scan_result=scan,
+            )
+            self.assertEqual(1, result["inserted"])
+            self.assertEqual((0.0, 0.0, 180.0, 85.0511287798066), result["bbox"])
+            connection = sqlite3.connect(output)
+            row = connection.execute(
+                "SELECT zoom_level,tile_column,tile_row FROM tiles"
+            ).fetchone()
+            metadata = dict(connection.execute("SELECT name,value FROM metadata"))
+            connection.close()
+            self.assertEqual((1, 1, 1), row)
+            self.assertEqual("global-mapper-z-y-x", metadata["source_layout"])
+            self.assertEqual("0.00000000,0.00000000,180.00000000,85.05112878", metadata["bounds"])
+
+    def test_rejects_global_mapper_like_zip_without_trusted_xml(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive_path = Path(folder) / "untrusted.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("arbitrary/Z1/0/1.png", b"\x89PNG\r\n\x1a\nmock tile")
+            original = get_language()
+            try:
+                for language, expected in (("ru", "не распознан"), ("en", "not recognized")):
+                    set_language(language)
+                    with self.assertRaises(ValueError) as caught:
+                        scan_global_mapper_zip(archive_path, lambda _: None)
+                    message = str(caught.exception)
+                    self.assertIn(expected, message)
+                    self.assertNotIn("['", message)
+            finally:
+                set_language(original)
+
+    def test_rejects_unsafe_global_mapper_xml_and_zip_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            unsafe_xml = root / "unsafe-xml.zip"
+            write_global_mapper_zip(
+                unsafe_xml,
+                xml=(
+                    b'<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>'
+                    b'<MapSource creator="Global Mapper"><BaseURL>Z%z/%y/%x.png</BaseURL></MapSource>'
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "DOCTYPE/ENTITY"):
+                scan_global_mapper_zip(unsafe_xml, lambda _: None)
+
+            utf16_xml = root / "unsafe-utf16-xml.zip"
+            write_global_mapper_zip(
+                utf16_xml,
+                xml=(
+                    '<?xml version="1.0" encoding="UTF-16"?>'
+                    '<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>'
+                    '<MapSource creator="Global Mapper"><BaseURL>Z%z/%y/%x.png</BaseURL></MapSource>'
+                ).encode("utf-16"),
+            )
+            with self.assertRaisesRegex(ValueError, "DOCTYPE/ENTITY"):
+                scan_global_mapper_zip(utf16_xml, lambda _: None)
+
+            oversized_xml = root / "oversized-xml.zip"
+            with zipfile.ZipFile(oversized_xml, "w") as archive:
+                archive.writestr("map.gm_source_def.xml", b"x" * (256 * 1024 + 1))
+                archive.writestr("Z1/0/1.png", b"\x89PNG\r\n\x1a\nmock tile")
+            with self.assertRaisesRegex(ValueError, "256"):
+                scan_global_mapper_zip(oversized_xml, lambda _: None)
+
+            traversal = root / "traversal.zip"
+            with zipfile.ZipFile(traversal, "w") as archive:
+                archive.writestr("../map.gm_source_def.xml", b"<x/>")
+            with self.assertRaises(ValueError):
+                scan_global_mapper_zip(traversal, lambda _: None)
+
+    def test_rejects_invalid_duplicate_and_mixed_global_mapper_tiles(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+
+            invalid_coordinate = root / "invalid-coordinate.zip"
+            write_global_mapper_zip(invalid_coordinate)
+            with zipfile.ZipFile(invalid_coordinate, "a") as archive:
+                archive.writestr("0-36 РККА-30 г/Z1/0/2.png", b"\x89PNG\r\n\x1a\nmock")
+            with self.assertRaisesRegex(ValueError, "x=2"):
+                scan_global_mapper_zip(invalid_coordinate, lambda _: None)
+
+            duplicate_coordinate = root / "duplicate-coordinate.zip"
+            write_global_mapper_zip(duplicate_coordinate)
+            with zipfile.ZipFile(duplicate_coordinate, "a") as archive:
+                archive.writestr("0-36 РККА-30 г/extra/Z1/0/1.png", b"\x89PNG\r\n\x1a\nmock")
+            with self.assertRaisesRegex(ValueError, "повторяющиеся|Duplicate"):
+                scan_global_mapper_zip(duplicate_coordinate, lambda _: None)
+
+            mixed_format = root / "mixed-format.zip"
+            write_global_mapper_zip(mixed_format)
+            with zipfile.ZipFile(mixed_format, "a") as archive:
+                archive.writestr("0-36 РККА-30 г/Z1/1/1.jpg", b"\xff\xd8\xffmock")
+            with self.assertRaisesRegex(ValueError, "смешаны|mixed"):
+                scan_global_mapper_zip(mixed_format, lambda _: None)
+
+            symlink = root / "symlink.zip"
+            with zipfile.ZipFile(symlink, "w") as archive:
+                link = zipfile.ZipInfo("tiles-link")
+                link.create_system = 3
+                link.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(link, "target")
+            with self.assertRaisesRegex(ValueError, "ссылку|link"):
+                scan_global_mapper_zip(symlink, lambda _: None)
+
+    def test_global_mapper_zip_pipeline_creates_verified_pmtiles_when_cli_available(self):
+        try:
+            cli = find_pmtiles_cli()
+        except FileNotFoundError:
+            self.skipTest("PMTiles CLI is not installed")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive_path = root / "global-mapper.zip"
+            write_global_mapper_zip(archive_path)
+            output = root / "global-mapper.pmtiles"
+            result = xyz_to_pmtiles(
+                archive_path,
+                output,
+                "Global Mapper pipeline",
+                "Example",
+                cli,
+                lambda _: None,
+            )
+            self.assertTrue(output.is_file())
+            self.assertEqual("global-mapper-z-y-x", result["source_layout"])
+            self.assertEqual(3, result["pmtiles"]["version"])
+            self.assertEqual(1, result["pmtiles"]["addressed_tiles"])
 
     def test_rejects_mixed_xyz_tile_formats(self):
         with tempfile.TemporaryDirectory() as folder:

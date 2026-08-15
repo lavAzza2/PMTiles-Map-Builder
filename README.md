@@ -10,7 +10,8 @@
 
 Простое Windows-приложение для подготовки растровых офлайн-карт для
 Android-приложения THS2. Помощник принимает кэш SAS.Planet, MBTiles,
-геопривязанные GeoTIFF/KMZ и папки тайлов XYZ, приводит источник к единому
+геопривязанные GeoTIFF/KMZ, папки тайлов XYZ и ZIP-экспорты Global Mapper,
+приводит источник к единому
 MBTiles, преобразует его в PMTiles v3 и проверяет готовый архив официальным
 PMTiles CLI.
 
@@ -28,6 +29,7 @@ PMTiles CLI.
 - запасной путь через экспортированный SAS.Planet файл `.mbtiles`;
 - конвертация геопривязанных `.tif`, `.tiff` и `.kmz` через GDAL;
 - сборка папок тайлов со структурой `z/x/y.png` или `z/x/y.jpg`;
+- безопасное распознавание ZIP Global Mapper со структурой `Z<zoom>/<y>/<x>.<ext>`;
 - поддержка растровых PNG, JPEG, WebP и AVIF;
 - запись названия карты и обязательной атрибуции источника;
 - проверка результата командой `pmtiles verify`;
@@ -113,6 +115,26 @@ tiles/z13/x5424/y2568.jpg
 подсчёта дополнительно проверяется свободное место для временного MBTiles и
 готового PMTiles.
 
+### ZIP-экспорт Global Mapper
+
+Во вкладке **XYZ** можно выбрать ZIP напрямую, предварительно распаковывать его
+не требуется. Формат включается только при наличии безопасно прочитанного
+`*.gm_source_def.xml`, где указаны `creator="Global Mapper"` и явный шаблон
+`BaseURL` вида `Z%z/%y/%x.png` (также поддерживаются JPEG, WebP и AVIF).
+
+Global Mapper сохраняет такие тайлы как `Z/y/x`, например:
+
+```text
+произвольная папка/036.gm_source_def.xml
+произвольная папка/Z10/302/597.png
+```
+
+Папка после масштаба считается координатой **Y**, имя файла — **X**. Координата
+Y трактуется как XYZ/Web Mercator и переводится в строку TMS для MBTiles.
+Границы и центр вычисляются по фактически найденным тайлам. Временный MBTiles
+получает метку `source_layout=global-mapper-z-y-x`, а итоговый PMTiles проходит
+обычную обязательную проверку.
+
 ## Большие карты
 
 Для исходников размером около 1 ГБ и больше открой раздел **Большие карты**:
@@ -140,6 +162,10 @@ tiles/z13/x5424/y2568.jpg
 - приложение не отправляет карты или координаты на сервер;
 - перед заменой существующего результата требуется подтверждение;
 - временный MBTiles удаляется после завершения;
+- ZIP проверяется на абсолютные и выходящие наружу пути, ссылки, специальные и
+  зашифрованные файлы, опасный объём/сжатие и слишком крупные тайлы;
+- XML Global Mapper ограничен 256 КиБ; объявления DOCTYPE/ENTITY запрещены,
+  внешние ресурсы не загружаются;
 - рядом с результатом сохраняется понятный JSON-отчёт о сборке.
 
 ## Права на карты и атрибуция
@@ -233,8 +259,9 @@ Windows-сборки перечислены в [THIRD_PARTY_NOTICES.md](THIRD_PA
 
 THS2 Map Builder is a Windows desktop application for creating verified raster
 PMTiles v3 offline maps for the [THS2 Android app](https://github.com/lavAzza2/THS2).
-It converts SAS.Planet cache data, MBTiles archives, XYZ tile directories, and
-georeferenced GeoTIFF/KMZ rasters into a format that THS2 can open directly.
+It converts SAS.Planet cache data, MBTiles archives, XYZ tile directories,
+Global Mapper ZIP exports, and georeferenced GeoTIFF/KMZ rasters into a format
+that THS2 can open directly.
 
 The application runs **next to an unmodified SAS.Planet installation**. It is
 not a SAS.Planet fork or plugin, does not interfere with tile downloads, and
@@ -249,6 +276,7 @@ never modifies the original SAS.Planet cache or XYZ source directory.
 - automatic restoration of the last tab, paths, zoom levels, and conversion options;
 - direct read-only access to SAS.Planet SQLite CacheType=71;
 - raster PNG, JPEG, WebP, and AVIF tile support;
+- safe Global Mapper ZIP detection for `Z<zoom>/<y>/<x>.<ext>` exports;
 - live conversion progress, elapsed time, XYZ tile count, speed, and ETA;
 - free-space preflight checks and a selectable temporary directory;
 - fast mode for very large maps using PMTiles `--no-deduplication`;
@@ -308,6 +336,25 @@ tiles/z13/x5424/y2568.jpg
 Zoom levels and bounds are detected automatically. XYZ Y coordinates are
 converted to TMS row numbers for the temporary MBTiles database. All tiles in
 one map must use the same image format.
+
+#### Global Mapper ZIP exports
+
+The **XYZ** tab also accepts a ZIP file directly; extracting it first is not
+required. This layout is enabled only when a safely parsed
+`*.gm_source_def.xml` declares `creator="Global Mapper"` and an explicit
+`Z%z/%y/%x.<format>` BaseURL template. An arbitrary or Cyrillic folder prefix
+is supported.
+
+In this export, the directory below `Z<zoom>` is **Y** and the file name is
+**X**. Y uses XYZ/Web Mercator orientation and is converted to the MBTiles TMS
+row. Actual bounds and center are calculated from the tile coordinates, and
+the temporary MBTiles records `source_layout=global-mapper-z-y-x`.
+
+ZIP paths, links, special/encrypted entries, expansion limits, duplicates,
+tile sizes, formats, zooms, and coordinate ranges are validated. Metadata XML
+is limited to 256 KiB; DOCTYPE and ENTITY declarations are rejected and no
+external resources are fetched. The final PMTiles still runs through
+`pmtiles verify`.
 
 #### GeoTIFF and KMZ
 
