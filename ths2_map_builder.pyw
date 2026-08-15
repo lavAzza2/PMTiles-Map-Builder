@@ -24,7 +24,7 @@ from map_builder_core import (
 )
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 
 def find_sas_root() -> Path | None:

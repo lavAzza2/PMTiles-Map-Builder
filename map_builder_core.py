@@ -271,6 +271,103 @@ def _write_mbtiles_metadata(
     connection.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
 
 
+def _xyz_index(name: str, prefix: str = "") -> int | None:
+    """Parse both plain XYZ names (13/42/17) and z/x/y-prefixed names."""
+    value = name
+    if prefix and value[:1].lower() == prefix:
+        value = value[1:]
+    return int(value) if value.isdigit() else None
+
+
+def _xyz_zoom_folders(tiles_root: Path) -> list[tuple[int, Path]]:
+    folders: list[tuple[int, Path]] = []
+    for path in tiles_root.iterdir():
+        if path.is_dir():
+            zoom = _xyz_index(path.name, "z")
+            if zoom is not None and 0 <= zoom <= 24:
+                folders.append((zoom, path))
+    return sorted(folders, key=lambda item: item[0])
+
+
+def _iter_xyz_tiles(zoom: int, zoom_folder: Path) -> Iterable[tuple[int, int, Path]]:
+    limit = 1 << zoom
+    for x_folder in zoom_folder.iterdir():
+        if not x_folder.is_dir():
+            continue
+        x = _xyz_index(x_folder.name, "x")
+        if x is None or not 0 <= x < limit:
+            continue
+        for tile_path in x_folder.iterdir():
+            if tile_path.is_file():
+                y = _xyz_index(tile_path.stem, "y")
+                if y is not None and 0 <= y < limit:
+                    yield x, y, tile_path
+
+
+def scan_xyz_directory(
+    tiles_root: Path,
+    log: Log = print,
+    progress: Progress | None = None,
+) -> dict[str, object]:
+    """Count an XYZ tree without retaining a potentially huge file manifest."""
+    if not tiles_root.is_dir():
+        raise FileNotFoundError(f"Не найдена папка тайлов: {tiles_root}")
+    zoom_folders = _xyz_zoom_folders(tiles_root)
+    if not zoom_folders:
+        raise ValueError("Не найдены папки масштабов XYZ. Поддерживаются имена 13 или z13.")
+
+    total_tiles = 0
+    total_bytes = 0
+    per_zoom: dict[int, int] = {}
+    started = time.monotonic()
+    last_update = started
+    if progress:
+        progress("Поиск тайлов XYZ — 0 найдено", None)
+    for index, (zoom, zoom_folder) in enumerate(zoom_folders, start=1):
+        zoom_count = 0
+        zoom_bytes = 0
+        for _x, _y, tile_path in _iter_xyz_tiles(zoom, zoom_folder):
+            zoom_count += 1
+            try:
+                zoom_bytes += tile_path.stat().st_size
+            except OSError as error:
+                raise OSError(f"Не удалось прочитать сведения о тайле {tile_path}: {error}") from error
+            now = time.monotonic()
+            if progress and (zoom_count % 1000 == 0 or now - last_update >= 0.5):
+                progress(
+                    f"Поиск тайлов XYZ — найдено {total_tiles + zoom_count:,}",
+                    None,
+                )
+                last_update = now
+        if zoom_count:
+            per_zoom[zoom] = zoom_count
+            total_tiles += zoom_count
+            total_bytes += zoom_bytes
+        log(f"Поиск XYZ, масштаб {zoom}: {zoom_count} тайлов, {format_bytes(zoom_bytes)}.")
+        if progress:
+            progress(
+                f"Поиск тайлов XYZ — найдено {total_tiles:,}",
+                None if index < len(zoom_folders) else 100,
+            )
+
+    if not total_tiles:
+        raise ValueError(
+            "В папке не найдены тайлы со структурой z/x/y.png или "
+            "zZ/xX/yY.png (также поддерживаются jpg/webp/avif)."
+        )
+    elapsed = max(0.01, time.monotonic() - started)
+    log(
+        f"Поиск XYZ завершён: {total_tiles:,} тайлов, {format_bytes(total_bytes)} "
+        f"за {elapsed:.1f} с."
+    )
+    return {
+        "tiles": total_tiles,
+        "bytes": total_bytes,
+        "zooms": per_zoom,
+        "elapsed": elapsed,
+    }
+
+
 def build_mbtiles_from_xyz(
     tiles_root: Path,
     output_path: Path,
@@ -278,10 +375,13 @@ def build_mbtiles_from_xyz(
     attribution: str,
     log: Log = print,
     progress: Progress | None = None,
+    scan_result: dict[str, object] | None = None,
 ) -> dict:
     """Build MBTiles from a read-only XYZ directory laid out as z/x/y.ext."""
     if not tiles_root.is_dir():
         raise FileNotFoundError(f"Не найдена папка тайлов: {tiles_root}")
+    scan_result = scan_result or scan_xyz_directory(tiles_root, log, progress)
+    total_tiles = int(scan_result["tiles"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
@@ -292,57 +392,66 @@ def build_mbtiles_from_xyz(
     zoom_bounds: dict[int, list[int]] = {}
     try:
         _create_mbtiles(target)
-        zoom_folders = sorted(
-            (path for path in tiles_root.iterdir() if path.is_dir() and path.name.isdigit()),
-            key=lambda path: int(path.name),
-        )
-        for zoom_index, zoom_folder in enumerate(zoom_folders, start=1):
-            zoom = int(zoom_folder.name)
-            if not 0 <= zoom <= 24:
-                continue
+        zoom_folders = _xyz_zoom_folders(tiles_root)
+        last_percent = -1
+        last_update = 0.0
+        build_started = time.monotonic()
+        if progress:
+            progress(f"Сборка XYZ — 0/{total_tiles:,} тайлов", 0)
+        for zoom, zoom_folder in zoom_folders:
             limit = 1 << zoom
             zoom_count = 0
             bounds = [limit, limit, -1, -1]
-            for x_folder in zoom_folder.iterdir():
-                if not x_folder.is_dir() or not x_folder.name.isdigit():
-                    continue
-                x = int(x_folder.name)
-                if not 0 <= x < limit:
-                    continue
-                for tile_path in x_folder.iterdir():
-                    if not tile_path.is_file() or not tile_path.stem.isdigit():
-                        continue
-                    y = int(tile_path.stem)
-                    if not 0 <= y < limit:
-                        continue
-                    blob = tile_path.read_bytes()
+            for x, y, tile_path in _iter_xyz_tiles(zoom, zoom_folder):
+                blob = tile_path.read_bytes()
+                try:
                     current_format = detect_tile_format(blob)
-                    if tile_format is None:
-                        tile_format = current_format
-                    elif current_format != tile_format:
-                        raise ValueError(
-                            "В папке смешаны форматы тайлов. Оставь только один: "
-                            "PNG, JPEG, WebP или AVIF."
-                        )
-                    target.execute(
-                        "INSERT OR REPLACE INTO tiles VALUES (?, ?, ?, ?)",
-                        (zoom, x, limit - 1 - y, blob),
+                except ValueError as error:
+                    raise ValueError(f"Неподдерживаемый или повреждённый тайл: {tile_path}") from error
+                if tile_format is None:
+                    tile_format = current_format
+                elif current_format != tile_format:
+                    raise ValueError(
+                        "В папке смешаны форматы тайлов. Оставь только один: "
+                        "PNG, JPEG, WebP или AVIF."
                     )
-                    bounds[0] = min(bounds[0], x)
-                    bounds[1] = min(bounds[1], y)
-                    bounds[2] = max(bounds[2], x)
-                    bounds[3] = max(bounds[3], y)
-                    zoom_count += 1
+                target.execute(
+                    "INSERT OR REPLACE INTO tiles VALUES (?, ?, ?, ?)",
+                    (zoom, x, limit - 1 - y, blob),
+                )
+                bounds[0] = min(bounds[0], x)
+                bounds[1] = min(bounds[1], y)
+                bounds[2] = max(bounds[2], x)
+                bounds[3] = max(bounds[3], y)
+                zoom_count += 1
+                processed = inserted + zoom_count
+                percent = min(100, processed * 100 // total_tiles)
+                now = time.monotonic()
+                if progress and (percent != last_percent or now - last_update >= 1.0):
+                    elapsed = max(0.01, now - build_started)
+                    speed = processed / elapsed
+                    remaining = int((total_tiles - processed) / speed) if speed else 0
+                    progress(
+                        f"Сборка XYZ — {processed:,}/{total_tiles:,} · "
+                        f"{speed:,.0f} тайл/с · осталось {remaining // 60:02d}:{remaining % 60:02d}",
+                        percent,
+                    )
+                    last_percent = percent
+                    last_update = now
             if zoom_count:
                 zoom_bounds[zoom] = bounds
                 inserted += zoom_count
                 target.commit()
-            log(f"Масштаб {zoom}: найдено {zoom_count} тайлов.")
-            if progress and zoom_folders:
-                progress("Сборка XYZ", zoom_index * 100 // len(zoom_folders))
+            log(f"Масштаб {zoom}: добавлено {zoom_count} тайлов.")
 
         if not inserted or tile_format is None:
             raise ValueError("В папке не найдены тайлы со структурой z/x/y.png (или jpg/webp/avif).")
+        stored_tiles = int(target.execute("SELECT COUNT(*) FROM tiles").fetchone()[0])
+        if stored_tiles != total_tiles:
+            raise ValueError(
+                f"Обнаружены повторяющиеся координаты XYZ: найдено файлов {total_tiles:,}, "
+                f"уникальных тайлов {stored_tiles:,}. Удали дубликаты и повтори преобразование."
+            )
         min_zoom = min(zoom_bounds)
         max_zoom = max(zoom_bounds)
         boxes = [
@@ -371,6 +480,8 @@ def build_mbtiles_from_xyz(
             description="Created by THS2 Map Builder from an XYZ tile directory",
         )
         target.commit()
+        if progress:
+            progress(f"Сборка XYZ — {inserted:,}/{total_tiles:,} тайлов", 100)
     except Exception:
         target.close()
         if output_path.exists():
@@ -388,6 +499,7 @@ def build_mbtiles_from_xyz(
         "format": tile_format,
         "min_zoom": min_zoom,
         "max_zoom": max_zoom,
+        "source_bytes": int(scan_result["bytes"]),
     }
 
 
@@ -973,12 +1085,37 @@ def xyz_to_pmtiles(
     temp_dir: Path | None = None,
     progress: Progress | None = None,
 ) -> dict:
+    scan_result = scan_xyz_directory(tiles_root, log, progress)
+    source_size = int(scan_result["bytes"])
+    requirements = working_space_requirements(source_size, "xyz")
+    temp_root = temp_dir or Path(tempfile.gettempdir())
+    temp_free = shutil.disk_usage(temp_root).free
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_free = shutil.disk_usage(output_path.parent).free
+    log(
+        f"Оценка места для XYZ: исходные тайлы {format_bytes(source_size)}, "
+        f"свободно во временной папке {format_bytes(temp_free)}, "
+        f"в папке результата {format_bytes(output_free)}."
+    )
+    minimum_temp = source_size + max(256 * 1024 ** 2, source_size // 5)
+    minimum_output = max(128 * 1024 ** 2, source_size // 2)
+    same_drive = temp_root.resolve().anchor.lower() == output_path.parent.resolve().anchor.lower()
+    if same_drive:
+        if temp_free < minimum_temp + minimum_output:
+            raise OSError("Недостаточно свободного места для временного MBTiles и результата XYZ.")
+    elif temp_free < minimum_temp or output_free < minimum_output:
+        raise OSError("Недостаточно свободного места для преобразования XYZ.")
+    if temp_free < requirements["temporary"] or output_free < requirements["output"]:
+        log(
+            "ВНИМАНИЕ: свободного места меньше рекомендуемого; преобразование будет "
+            "продолжено, так как обязательный минимум доступен."
+        )
     with tempfile.TemporaryDirectory(
         prefix="ths2-map-builder-xyz-", dir=str(temp_dir) if temp_dir else None
     ) as temp_folder:
         mbtiles_path = Path(temp_folder) / "xyz-export.mbtiles"
         source_result = build_mbtiles_from_xyz(
-            tiles_root, mbtiles_path, name, attribution, log, progress
+            tiles_root, mbtiles_path, name, attribution, log, progress, scan_result
         )
         pmtiles_result = convert_mbtiles(
             mbtiles_path, output_path, cli, log,
