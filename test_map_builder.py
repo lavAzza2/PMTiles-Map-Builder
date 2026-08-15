@@ -17,6 +17,7 @@ from map_builder_core import (
     parse_hlg,
     read_pmtiles_header,
     run_process_streaming,
+    scan_xyz_directory,
     tile_range,
     xyz_to_pmtiles,
     working_space_requirements,
@@ -156,6 +157,40 @@ class MapBuilderTests(unittest.TestCase):
             self.assertEqual((8, 128, 128), row)
             self.assertEqual("png", metadata["format"])
             self.assertEqual("Example", metadata["attribution"])
+
+    def test_xyz_prefixed_names_and_tile_progress(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for y in (126, 127):
+                tile = root / "tiles" / "z8" / "x128" / f"y{y}.png"
+                tile.parent.mkdir(parents=True, exist_ok=True)
+                tile.write_bytes(b"\x89PNG\r\n\x1a\nmock tile")
+
+            progress_events = []
+            scan = scan_xyz_directory(
+                root / "tiles",
+                lambda _: None,
+                lambda stage, percent: progress_events.append((stage, percent)),
+            )
+            self.assertEqual(2, scan["tiles"])
+            self.assertIn(None, [percent for _, percent in progress_events])
+
+            progress_events.clear()
+            output = root / "prefixed.mbtiles"
+            result = build_mbtiles_from_xyz(
+                root / "tiles",
+                output,
+                "Prefixed XYZ",
+                "Example",
+                lambda _: None,
+                lambda stage, percent: progress_events.append((stage, percent)),
+                scan,
+            )
+            self.assertEqual(2, result["inserted"])
+            build_events = [event for event in progress_events if event[0].startswith("Сборка XYZ")]
+            self.assertEqual(0, build_events[0][1])
+            self.assertEqual(100, build_events[-1][1])
+            self.assertTrue(any("2/2" in stage for stage, _ in build_events))
 
     def test_rejects_mixed_xyz_tile_formats(self):
         with tempfile.TemporaryDirectory() as folder:
