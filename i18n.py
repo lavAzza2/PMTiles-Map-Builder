@@ -35,25 +35,39 @@ def settings_path() -> Path:
     return base / "THS2 Map Builder" / "settings.json"
 
 
-def load_language() -> str:
+def load_settings() -> dict[str, object]:
     try:
-        value = json.loads(settings_path().read_text(encoding="utf-8")).get("language")
-        if value in SUPPORTED_LANGUAGES:
-            return value
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
+        payload = json.loads(settings_path().read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_settings(settings: dict[str, object]) -> None:
+    """Atomically save preferences so an interrupted write cannot corrupt them."""
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def load_language() -> str:
+    value = load_settings().get("language")
+    if value in SUPPORTED_LANGUAGES:
+        return str(value)
     return detect_system_language()
 
 
 def save_language(language: str) -> None:
     if language not in SUPPORTED_LANGUAGES:
         raise ValueError(f"Unsupported language: {language}")
-    path = settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"language": language}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    settings = load_settings()
+    settings["language"] = language
+    save_settings(settings)
 
 
 def set_language(language: str) -> None:

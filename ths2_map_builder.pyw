@@ -10,7 +10,14 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from i18n import get_language, save_language, set_language, tr
+from i18n import (
+    get_language,
+    load_settings,
+    save_language,
+    save_settings,
+    set_language,
+    tr,
+)
 from map_builder_core import (
     cache_to_pmtiles,
     convert_mbtiles,
@@ -25,7 +32,7 @@ from map_builder_core import (
 )
 
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 COLORS = {
     "background": "#0b1220",
@@ -67,30 +74,77 @@ class App(tk.Tk):
         self.minsize(780, 780)
         self.configure(background=COLORS["background"])
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.mode = tk.StringVar(value="cache")
-        self.mbtiles = tk.StringVar()
-        self.raster = tk.StringVar()
-        self.xyz_folder = tk.StringVar()
-        self.cache = tk.StringVar(value=str(DEFAULT_CACHE) if SAS_ROOT else "")
-        self.selection = tk.StringVar(value=str(DEFAULT_SELECTION) if SAS_ROOT else "")
-        self.output = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR / "THS2-map.pmtiles"))
-        self.name = tk.StringVar(value=tr("Карта THS2", "THS2 Map"))
-        self.attribution = tk.StringVar()
-        self.min_zoom = tk.IntVar(value=13)
-        self.max_zoom = tk.IntVar(value=19)
-        self.raster_format = tk.StringVar(value="PNG")
-        self.jpeg_quality = tk.IntVar(value=85)
-        self.temp_dir = tk.StringVar()
-        self.fast_mode = tk.BooleanVar(value=False)
+        self.preferences = load_settings()
+
+        def text_preference(key: str, default: str = "") -> str:
+            value = self.preferences.get(key, default)
+            return value if isinstance(value, str) else default
+
+        def integer_preference(key: str, default: int, minimum: int, maximum: int) -> int:
+            value = self.preferences.get(key, default)
+            return value if isinstance(value, int) and minimum <= value <= maximum else default
+
+        saved_mode = text_preference("mode", "cache")
+        if saved_mode not in {"cache", "mbtiles", "xyz", "raster"}:
+            saved_mode = "cache"
+        saved_raster_format = text_preference("raster_format", "PNG").upper()
+        if saved_raster_format not in {"PNG", "JPEG"}:
+            saved_raster_format = "PNG"
+
+        self.mode = tk.StringVar(value=saved_mode)
+        self.mbtiles = tk.StringVar(value=text_preference("mbtiles"))
+        self.raster = tk.StringVar(value=text_preference("raster"))
+        self.xyz_folder = tk.StringVar(value=text_preference("xyz_folder"))
+        self.cache = tk.StringVar(
+            value=text_preference("cache", str(DEFAULT_CACHE) if SAS_ROOT else "")
+        )
+        self.selection = tk.StringVar(
+            value=text_preference("selection", str(DEFAULT_SELECTION) if SAS_ROOT else "")
+        )
+        self.output = tk.StringVar(
+            value=text_preference("output", str(DEFAULT_OUTPUT_DIR / "THS2-map.pmtiles"))
+        )
+        self.name = tk.StringVar(
+            value=text_preference("name", tr("Карта THS2", "THS2 Map"))
+        )
+        self.attribution = tk.StringVar(value=text_preference("attribution"))
+        self.min_zoom = tk.IntVar(value=integer_preference("min_zoom", 13, 0, 24))
+        self.max_zoom = tk.IntVar(value=integer_preference("max_zoom", 19, 0, 24))
+        self.raster_format = tk.StringVar(value=saved_raster_format)
+        self.jpeg_quality = tk.IntVar(value=integer_preference("jpeg_quality", 85, 1, 100))
+        self.temp_dir = tk.StringVar(value=text_preference("temp_dir"))
+        self.fast_mode = tk.BooleanVar(value=self.preferences.get("fast_mode") is True)
         self.status = tk.StringVar(value=tr("Готов к работе", "Ready"))
         self.started_at: float | None = None
         self.current_stage = ""
         self.current_percent: int | None = None
         self.diagnostic_path: Path | None = None
+        self._settings_save_job: str | None = None
+        self._poll_job: str | None = None
+        self._settings_error_reported = False
         self._configure_theme()
         self._build()
+        for variable in (
+            self.mode,
+            self.mbtiles,
+            self.raster,
+            self.xyz_folder,
+            self.cache,
+            self.selection,
+            self.output,
+            self.name,
+            self.attribution,
+            self.min_zoom,
+            self.max_zoom,
+            self.raster_format,
+            self.jpeg_quality,
+            self.temp_dir,
+            self.fast_mode,
+        ):
+            variable.trace_add("write", self._schedule_settings_save)
+        self.protocol("WM_DELETE_WINDOW", self._close)
         self.after_idle(self._apply_dark_titlebar)
-        self.after(100, self._poll)
+        self._poll_job = self.after(100, self._poll)
 
     def _configure_theme(self) -> None:
         style = ttk.Style(self)
@@ -234,6 +288,65 @@ class App(tk.Tk):
                     break
         except Exception:
             pass
+
+    def _collect_preferences(self) -> dict[str, object]:
+        def integer_value(variable: tk.IntVar, key: str, default: int) -> int:
+            try:
+                return int(variable.get())
+            except (ValueError, tk.TclError):
+                previous = self.preferences.get(key, default)
+                return previous if isinstance(previous, int) else default
+
+        return {
+            "mode": self.mode.get(),
+            "mbtiles": self.mbtiles.get(),
+            "raster": self.raster.get(),
+            "xyz_folder": self.xyz_folder.get(),
+            "cache": self.cache.get(),
+            "selection": self.selection.get(),
+            "output": self.output.get(),
+            "name": self.name.get(),
+            "attribution": self.attribution.get(),
+            "min_zoom": integer_value(self.min_zoom, "min_zoom", 13),
+            "max_zoom": integer_value(self.max_zoom, "max_zoom", 19),
+            "raster_format": self.raster_format.get(),
+            "jpeg_quality": integer_value(self.jpeg_quality, "jpeg_quality", 85),
+            "temp_dir": self.temp_dir.get(),
+            "fast_mode": bool(self.fast_mode.get()),
+        }
+
+    def _schedule_settings_save(self, *_args) -> None:
+        if self._settings_save_job is not None:
+            self.after_cancel(self._settings_save_job)
+        self._settings_save_job = self.after(500, self._save_preferences)
+
+    def _save_preferences(self) -> None:
+        self._settings_save_job = None
+        try:
+            settings = load_settings()
+            settings.update(self._collect_preferences())
+            save_settings(settings)
+            self.preferences = settings
+            self._settings_error_reported = False
+        except (OSError, ValueError, tk.TclError) as error:
+            if not self._settings_error_reported and hasattr(self, "log"):
+                self._append(
+                    tr(
+                        f"Не удалось автоматически сохранить настройки: {error}",
+                        f"Could not save settings automatically: {error}",
+                    )
+                )
+                self._settings_error_reported = True
+
+    def _close(self) -> None:
+        if self._settings_save_job is not None:
+            self.after_cancel(self._settings_save_job)
+            self._settings_save_job = None
+        self._save_preferences()
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+        self.destroy()
 
     def _build(self) -> None:
         root = ttk.Frame(self, padding=(24, 20))
@@ -879,6 +992,7 @@ class App(tk.Tk):
             messagebox.showerror(tr("Проверка не пройдена", "Verification failed"), str(error))
 
     def _poll(self):
+        self._poll_job = None
         try:
             while True:
                 kind, value = self.queue.get_nowait()
@@ -942,7 +1056,7 @@ class App(tk.Tk):
             self.status.set(
                 f"{self.current_stage}{suffix} · {elapsed // 60:02d}:{elapsed % 60:02d}"
             )
-        self.after(100, self._poll)
+        self._poll_job = self.after(100, self._poll)
 
 
 if __name__ == "__main__":
