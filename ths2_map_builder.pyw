@@ -32,7 +32,7 @@ from map_builder_core import (
 )
 
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 
 COLORS = {
     "background": "#0b1220",
@@ -410,12 +410,23 @@ class App(tk.Tk):
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
         xyz_tab = self.mode_tabs["xyz"]
-        self._path_row(xyz_tab, tr("Папка тайлов XYZ", "XYZ tile folder"), self.xyz_folder, self._choose_xyz, 0)
+        xyz_row = self._path_row(
+            xyz_tab,
+            tr("Папка XYZ или ZIP", "XYZ folder or ZIP"),
+            self.xyz_folder,
+            self._choose_xyz,
+            0,
+        )
+        ttk.Button(
+            xyz_row,
+            text=tr("Выбрать ZIP…", "Choose ZIP…"),
+            command=self._choose_xyz_zip,
+        ).grid(row=0, column=3, padx=(8, 0))
         ttk.Label(
             xyz_tab,
             text=tr(
-                "Поддерживаются 13/5424/2568.jpg и z13/x5424/y2568.jpg. Масштабы определяются автоматически.",
-                "Supports 13/5424/2568.jpg and z13/x5424/y2568.jpg. Zoom levels are detected automatically.",
+                "XYZ: 13/5424/2568.jpg. Папки и ZIP Global Mapper Z/y/x определяются по XML.",
+                "XYZ: 13/5424/2568.jpg. Global Mapper Z/y/x folders and ZIPs are detected by XML.",
             ),
             style="CardMuted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -678,6 +689,19 @@ class App(tk.Tk):
             self.xyz_folder.set(value)
             self.name.set(Path(value).name)
             self.output.set(str(DEFAULT_OUTPUT_DIR / f"{Path(value).name}.pmtiles"))
+
+    def _choose_xyz_zip(self):
+        value = filedialog.askopenfilename(
+            title=tr("Выбери ZIP-экспорт Global Mapper", "Select a Global Mapper ZIP export"),
+            filetypes=[
+                (tr("ZIP-архивы Global Mapper", "Global Mapper ZIP archives"), "*.zip"),
+                (tr("Все файлы", "All files"), "*.*"),
+            ],
+        )
+        if value:
+            self.xyz_folder.set(value)
+            self.name.set(Path(value).stem)
+            self.output.set(str(DEFAULT_OUTPUT_DIR / f"{Path(value).stem}.pmtiles"))
 
     def _choose_cache(self):
         value = filedialog.askdirectory()
