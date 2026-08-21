@@ -115,12 +115,15 @@ tiles/z13/x5424/y2568.jpg
 подсчёта дополнительно проверяется свободное место для временного MBTiles и
 готового PMTiles.
 
-### ZIP-экспорт Global Mapper
+### Папка или ZIP-экспорт Global Mapper
 
-Во вкладке **XYZ** можно выбрать ZIP напрямую, предварительно распаковывать его
-не требуется. Формат включается только при наличии безопасно прочитанного
+Во вкладке **XYZ** можно выбрать распакованную папку или ZIP напрямую. Для ZIP
+предварительная распаковка не требуется. Формат включается только при наличии
+безопасно прочитанного
 `*.gm_source_def.xml`, где указаны `creator="Global Mapper"` и явный шаблон
 `BaseURL` вида `Z%z/%y/%x.png` (также поддерживаются JPEG, WebP и AVIF).
+Поддерживается и официальный вариант creator вида
+`Global Mapper - http://www.globalmapper.com`.
 
 Global Mapper сохраняет такие тайлы как `Z/y/x`, например:
 
@@ -337,13 +340,15 @@ Zoom levels and bounds are detected automatically. XYZ Y coordinates are
 converted to TMS row numbers for the temporary MBTiles database. All tiles in
 one map must use the same image format.
 
-#### Global Mapper ZIP exports
+#### Global Mapper folders and ZIP exports
 
-The **XYZ** tab also accepts a ZIP file directly; extracting it first is not
-required. This layout is enabled only when a safely parsed
+The **XYZ** tab accepts either an extracted directory or a ZIP file directly;
+extracting a ZIP first is not required. This layout is enabled only when a
+safely parsed
 `*.gm_source_def.xml` declares `creator="Global Mapper"` and an explicit
 `Z%z/%y/%x.<format>` BaseURL template. An arbitrary or Cyrillic folder prefix
-is supported.
+is supported. The official creator form
+`Global Mapper - http://www.globalmapper.com` is also recognized.
 
 In this export, the directory below `Z<zoom>` is **Y** and the file name is
 **X**. Y uses XYZ/Web Mercator orientation and is converted to the MBTiles TMS

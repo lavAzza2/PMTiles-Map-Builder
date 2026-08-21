@@ -334,6 +334,11 @@ def scan_xyz_directory(
     """Count an XYZ tree without retaining a potentially huge file manifest."""
     if not tiles_root.is_dir():
         raise FileNotFoundError(tr(f"Не найдена папка тайлов: {tiles_root}", f"Tile folder not found: {tiles_root}"))
+    global_mapper_scan = scan_global_mapper_directory(
+        tiles_root, log, progress, allow_absent=True
+    )
+    if global_mapper_scan is not None:
+        return global_mapper_scan
     zoom_folders = _xyz_zoom_folders(tiles_root)
     if not zoom_folders:
         raise ValueError(tr("Не найдены папки масштабов XYZ. Поддерживаются имена 13 или z13.", "No XYZ zoom folders found. Folder names such as 13 or z13 are supported."))
@@ -403,6 +408,16 @@ def build_mbtiles_from_xyz(
     if not tiles_root.is_dir():
         raise FileNotFoundError(tr(f"Не найдена папка тайлов: {tiles_root}", f"Tile folder not found: {tiles_root}"))
     scan_result = scan_result or scan_xyz_directory(tiles_root, log, progress)
+    if scan_result.get("layout") == "global-mapper-z-y-x":
+        return build_mbtiles_from_global_mapper_directory(
+            tiles_root,
+            output_path,
+            name,
+            attribution,
+            log,
+            progress,
+            scan_result,
+        )
     total_tiles = int(scan_result["tiles"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
@@ -564,18 +579,8 @@ def _xml_local_name(value: str) -> str:
     return value.rsplit("}", 1)[-1].rsplit(":", 1)[-1].casefold()
 
 
-def _read_global_mapper_metadata(
-    archive: zipfile.ZipFile, info: zipfile.ZipInfo
-) -> tuple[str, str] | None:
-    if info.file_size > GLOBAL_MAPPER_XML_LIMIT:
-        raise ValueError(
-            tr(
-                "Файл метаданных Global Mapper превышает безопасный лимит 256 КиБ.",
-                "The Global Mapper metadata file exceeds the safe 256 KiB limit.",
-            )
-        )
-    with archive.open(info, "r") as stream:
-        payload = stream.read(GLOBAL_MAPPER_XML_LIMIT + 1)
+def _parse_global_mapper_metadata(payload: bytes) -> tuple[str, str] | None:
+    """Parse trusted layout facts without resolving schemas or external resources."""
     if len(payload) > GLOBAL_MAPPER_XML_LIMIT:
         raise ValueError(
             tr(
@@ -625,7 +630,11 @@ def _read_global_mapper_metadata(
             elif local_key == "tilesize":
                 tile_sizes.append(clean_value)
 
-    if not any(value.casefold() == "global mapper" for value in creators):
+    trusted_creator = re.compile(
+        r"^global mapper(?:\s*-\s*https?://(?:www\.)?globalmapper\.com/?)?$",
+        re.IGNORECASE,
+    )
+    if not any(trusted_creator.fullmatch(value.strip()) for value in creators):
         return None
     layout_pattern = re.compile(
         r"(?:^|[/\\])Z%z[/\\]%y[/\\]%x\.(png|jpe?g|webp|avif)(?:[?#].*)?$",
@@ -641,8 +650,8 @@ def _read_global_mapper_metadata(
     if native_projections and not any("3857" in value for value in native_projections):
         raise ValueError(
             tr(
-                "Этот ZIP Global Mapper использует не Web Mercator (EPSG:3857).",
-                "This Global Mapper ZIP does not use Web Mercator (EPSG:3857).",
+                "Экспорт Global Mapper использует не Web Mercator (EPSG:3857).",
+                "The Global Mapper export does not use Web Mercator (EPSG:3857).",
             )
         )
     if tile_sizes and not all(value == "256" for value in tile_sizes):
@@ -654,6 +663,50 @@ def _read_global_mapper_metadata(
         )
     extension = extensions.pop()
     return TILE_EXTENSIONS[extension], extension
+
+
+def _read_global_mapper_zip_metadata(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo
+) -> tuple[str, str] | None:
+    if info.file_size > GLOBAL_MAPPER_XML_LIMIT:
+        raise ValueError(
+            tr(
+                "Файл метаданных Global Mapper превышает безопасный лимит 256 КиБ.",
+                "The Global Mapper metadata file exceeds the safe 256 KiB limit.",
+            )
+        )
+    with archive.open(info, "r") as stream:
+        payload = stream.read(GLOBAL_MAPPER_XML_LIMIT + 1)
+    return _parse_global_mapper_metadata(payload)
+
+
+def _read_global_mapper_file_metadata(path: Path) -> tuple[str, str] | None:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise OSError(
+            tr(
+                f"Не удалось прочитать метаданные Global Mapper: {path}",
+                f"Could not read Global Mapper metadata: {path}",
+            )
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(
+            tr(
+                "Файл метаданных Global Mapper не должен быть ссылкой или специальным файлом.",
+                "Global Mapper metadata must not be a link or special file.",
+            )
+        )
+    if info.st_size > GLOBAL_MAPPER_XML_LIMIT:
+        raise ValueError(
+            tr(
+                "Файл метаданных Global Mapper превышает безопасный лимит 256 КиБ.",
+                "The Global Mapper metadata file exceeds the safe 256 KiB limit.",
+            )
+        )
+    with path.open("rb") as stream:
+        payload = stream.read(GLOBAL_MAPPER_XML_LIMIT + 1)
+    return _parse_global_mapper_metadata(payload)
 
 
 def _global_mapper_tile_coordinates(
@@ -685,6 +738,362 @@ def _global_mapper_tile_coordinates(
             )
         )
     return zoom, x, y, match.group(4).casefold()
+
+
+def _find_global_mapper_directory_metadata(
+    tiles_root: Path,
+) -> tuple[Path, str, str] | None:
+    candidates: list[Path] = []
+    for current_root, directory_names, file_names in os.walk(tiles_root, followlinks=False):
+        current = Path(current_root)
+        directory_names[:] = [
+            name for name in directory_names if not (current / name).is_symlink()
+        ]
+        for file_name in file_names:
+            if file_name.casefold().endswith(".gm_source_def.xml"):
+                candidates.append(current / file_name)
+                if len(candidates) > 32:
+                    raise ValueError(
+                        tr(
+                            "В папке слишком много файлов метаданных Global Mapper.",
+                            "The folder contains too many Global Mapper metadata files.",
+                        )
+                    )
+    if not candidates:
+        return None
+
+    trusted: list[tuple[Path, str, str]] = []
+    for path in candidates:
+        detected = _read_global_mapper_file_metadata(path)
+        if detected is not None:
+            tile_format, declared_extension = detected
+            trusted.append((path, tile_format, declared_extension))
+    if len(trusted) != 1:
+        raise ValueError(
+            tr(
+                "Папка не распознана как экспорт Global Mapper: нужен один безопасный *.gm_source_def.xml с официальным creator Global Mapper и шаблоном BaseURL Z%z/%y/%x.<формат>.",
+                "The folder is not recognized as a Global Mapper export: it needs one safe *.gm_source_def.xml with an official Global Mapper creator and a Z%z/%y/%x.<format> BaseURL template.",
+            )
+        )
+    return trusted[0]
+
+
+def _iter_global_mapper_directory_tiles(
+    metadata_root: Path,
+) -> Iterable[tuple[int, int, int, str, Path]]:
+    for zoom, zoom_folder in _xyz_zoom_folders(metadata_root):
+        limit = 1 << zoom
+        for y_folder in zoom_folder.iterdir():
+            if y_folder.is_symlink() or not y_folder.is_dir():
+                continue
+            y = _xyz_index(y_folder.name)
+            if y is None:
+                continue
+            if not 0 <= y < limit:
+                raise ValueError(
+                    tr(
+                        f"Координата Y выходит за сетку Z{zoom}: y={y}.",
+                        f"Y coordinate is outside the Z{zoom} grid: y={y}.",
+                    )
+                )
+            for tile_path in y_folder.iterdir():
+                if tile_path.is_symlink() or not tile_path.is_file():
+                    continue
+                extension = tile_path.suffix.lstrip(".").casefold()
+                if extension not in TILE_EXTENSIONS:
+                    continue
+                x = _xyz_index(tile_path.stem)
+                if x is None:
+                    continue
+                if not 0 <= x < limit:
+                    raise ValueError(
+                        tr(
+                            f"Координата X выходит за сетку Z{zoom}: x={x}.",
+                            f"X coordinate is outside the Z{zoom} grid: x={x}.",
+                        )
+                    )
+                yield zoom, x, y, extension, tile_path
+
+
+def scan_global_mapper_directory(
+    tiles_root: Path,
+    log: Log = print,
+    progress: Progress | None = None,
+    *,
+    allow_absent: bool = False,
+) -> dict[str, object] | None:
+    """Validate and scan a read-only Global Mapper Z/Y/X directory."""
+    if not tiles_root.is_dir():
+        raise FileNotFoundError(
+            tr(f"Не найдена папка тайлов: {tiles_root}", f"Tile folder not found: {tiles_root}")
+        )
+    metadata = _find_global_mapper_directory_metadata(tiles_root)
+    if metadata is None:
+        if allow_absent:
+            return None
+        raise ValueError(
+            tr(
+                "В папке не найден подтверждающий *.gm_source_def.xml Global Mapper.",
+                "No confirming Global Mapper *.gm_source_def.xml was found in the folder.",
+            )
+        )
+    metadata_path, tile_format, declared_extension = metadata
+    metadata_root = metadata_path.parent
+    started = time.monotonic()
+    if progress:
+        progress(tr("Проверка папки Global Mapper", "Checking Global Mapper folder"), None)
+    total_tiles = 0
+    total_tile_bytes = 0
+    per_zoom: dict[int, int] = {}
+    coordinates: set[tuple[int, int, int]] = set()
+    for zoom, x, y, member_extension, tile_path in _iter_global_mapper_directory_tiles(
+        metadata_root
+    ):
+        if TILE_EXTENSIONS[member_extension] != tile_format:
+            raise ValueError(
+                tr(
+                    "В папке смешаны форматы тайлов или они не совпадают с XML Global Mapper.",
+                    "The folder contains mixed tile formats or they do not match the Global Mapper XML.",
+                )
+            )
+        try:
+            size = tile_path.stat().st_size
+        except OSError as error:
+            raise OSError(
+                tr(
+                    f"Не удалось прочитать сведения о тайле {tile_path}.",
+                    f"Could not read tile information for {tile_path}.",
+                )
+            ) from error
+        if size > ZIP_MAX_TILE_BYTES:
+            raise ValueError(
+                tr("Один из тайлов слишком большой.", "A tile is too large.")
+            )
+        coordinate = (zoom, x, y)
+        if coordinate in coordinates:
+            raise ValueError(
+                tr(
+                    "В папке обнаружены повторяющиеся координаты тайлов.",
+                    "Duplicate tile coordinates were found in the folder.",
+                )
+            )
+        coordinates.add(coordinate)
+        per_zoom[zoom] = per_zoom.get(zoom, 0) + 1
+        total_tiles += 1
+        total_tile_bytes += size
+        if progress and total_tiles % 1000 == 0:
+            progress(
+                tr(
+                    f"Проверка папки Global Mapper — найдено {total_tiles:,}",
+                    f"Checking Global Mapper folder — {total_tiles:,} found",
+                ),
+                None,
+            )
+    if not total_tiles:
+        raise ValueError(
+            tr(
+                "В подтверждённом экспорте Global Mapper не найдены тайлы Z<zoom>/<y>/<x>.<формат>.",
+                "No Z<zoom>/<y>/<x>.<format> tiles were found in the confirmed Global Mapper export.",
+            )
+        )
+    elapsed = max(0.01, time.monotonic() - started)
+    log(
+        tr(
+            f"Папка Global Mapper: найдено {total_tiles:,} тайлов Z{min(per_zoom)}–Z{max(per_zoom)}, {format_bytes(total_tile_bytes)}.",
+            f"Global Mapper folder: found {total_tiles:,} tiles at Z{min(per_zoom)}–Z{max(per_zoom)}, {format_bytes(total_tile_bytes)}.",
+        )
+    )
+    if progress:
+        progress(tr("Проверка папки Global Mapper", "Checking Global Mapper folder"), 100)
+    return {
+        "layout": "global-mapper-z-y-x",
+        "source_kind": "directory",
+        "metadata_path": str(metadata_path),
+        "metadata_root": str(metadata_root),
+        "declared_extension": declared_extension,
+        "format": tile_format,
+        "tiles": total_tiles,
+        "bytes": total_tile_bytes,
+        "zooms": per_zoom,
+        "elapsed": elapsed,
+    }
+
+
+def build_mbtiles_from_global_mapper_directory(
+    tiles_root: Path,
+    output_path: Path,
+    name: str,
+    attribution: str,
+    log: Log = print,
+    progress: Progress | None = None,
+    scan_result: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build TMS MBTiles from a trusted read-only Global Mapper Z/Y/X folder."""
+    scan_result = scan_result or scan_global_mapper_directory(
+        tiles_root, log, progress
+    )
+    if scan_result is None:
+        raise ValueError(tr("Папка Global Mapper не распознана.", "Global Mapper folder was not recognized."))
+    total_tiles = int(scan_result["tiles"])
+    metadata_root = Path(str(scan_result["metadata_root"]))
+    expected_format = str(scan_result["format"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    target = sqlite3.connect(output_path)
+    inserted = 0
+    zoom_bounds: dict[int, list[int]] = {}
+    started = time.monotonic()
+    last_percent = -1
+    last_update = 0.0
+    try:
+        _create_mbtiles(target)
+        if progress:
+            progress(
+                tr(
+                    f"Сборка Global Mapper — 0/{total_tiles:,} тайлов",
+                    f"Building Global Mapper — 0/{total_tiles:,} tiles",
+                ),
+                0,
+            )
+        for zoom, x, y, member_extension, tile_path in _iter_global_mapper_directory_tiles(
+            metadata_root
+        ):
+            if TILE_EXTENSIONS[member_extension] != expected_format:
+                raise ValueError(
+                    tr(
+                        "В папке смешаны форматы тайлов или они не совпадают с XML Global Mapper.",
+                        "The folder contains mixed tile formats or they do not match the Global Mapper XML.",
+                    )
+                )
+            try:
+                with tile_path.open("rb") as stream:
+                    blob = stream.read(ZIP_MAX_TILE_BYTES + 1)
+            except OSError as error:
+                raise OSError(
+                    tr(
+                        f"Не удалось прочитать тайл {tile_path}.",
+                        f"Could not read tile {tile_path}.",
+                    )
+                ) from error
+            if len(blob) > ZIP_MAX_TILE_BYTES:
+                raise ValueError(tr("Один из тайлов слишком большой.", "A tile is too large."))
+            try:
+                tile_format = detect_tile_format(blob)
+            except ValueError as error:
+                raise ValueError(
+                    tr(
+                        f"Неподдерживаемый или повреждённый тайл: {tile_path}",
+                        f"Unsupported or corrupted tile: {tile_path}",
+                    )
+                ) from error
+            if tile_format != expected_format:
+                raise ValueError(
+                    tr(
+                        "Формат данных тайлов не совпадает с XML Global Mapper или в папке смешаны форматы.",
+                        "Tile data does not match the Global Mapper XML, or the folder contains mixed formats.",
+                    )
+                )
+            limit = 1 << zoom
+            try:
+                target.execute(
+                    "INSERT INTO tiles VALUES (?, ?, ?, ?)",
+                    (zoom, x, limit - 1 - y, blob),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    tr(
+                        "В папке обнаружены повторяющиеся координаты тайлов.",
+                        "Duplicate tile coordinates were found in the folder.",
+                    )
+                ) from error
+            bounds = zoom_bounds.setdefault(zoom, [limit, limit, -1, -1])
+            bounds[0] = min(bounds[0], x)
+            bounds[1] = min(bounds[1], y)
+            bounds[2] = max(bounds[2], x)
+            bounds[3] = max(bounds[3], y)
+            inserted += 1
+            percent = min(100, inserted * 100 // total_tiles)
+            now = time.monotonic()
+            if progress and (percent != last_percent or now - last_update >= 1.0):
+                elapsed = max(0.01, now - started)
+                speed = inserted / elapsed
+                remaining = int((total_tiles - inserted) / speed) if speed else 0
+                progress(
+                    tr(
+                        f"Сборка Global Mapper — {inserted:,}/{total_tiles:,} · {speed:,.0f} тайл/с · осталось {remaining // 60:02d}:{remaining % 60:02d}",
+                        f"Building Global Mapper — {inserted:,}/{total_tiles:,} · {speed:,.0f} tiles/s · {remaining // 60:02d}:{remaining % 60:02d} remaining",
+                    ),
+                    percent,
+                )
+                last_percent = percent
+                last_update = now
+            if inserted % 1000 == 0:
+                target.commit()
+        if inserted != total_tiles:
+            raise ValueError(
+                tr(
+                    "Количество прочитанных тайлов папки неожиданно изменилось.",
+                    "The number of folder tiles changed unexpectedly.",
+                )
+            )
+        min_zoom = min(zoom_bounds)
+        max_zoom = max(zoom_bounds)
+        boxes = [
+            (
+                x_to_lon(bounds[0], zoom),
+                y_to_lat(bounds[3] + 1, zoom),
+                x_to_lon(bounds[2] + 1, zoom),
+                y_to_lat(bounds[1], zoom),
+            )
+            for zoom, bounds in zoom_bounds.items()
+        ]
+        bbox = (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+        _write_mbtiles_metadata(
+            target,
+            name=name or metadata_root.name,
+            attribution=attribution,
+            tile_format=expected_format,
+            min_zoom=min_zoom,
+            max_zoom=max_zoom,
+            bbox=bbox,
+            description="Created by THS2 Map Builder from a Global Mapper Z/Y/X directory",
+            extra={"source_layout": "global-mapper-z-y-x"},
+        )
+        target.commit()
+        if progress:
+            progress(
+                tr(
+                    f"Сборка Global Mapper — {inserted:,}/{total_tiles:,} тайлов",
+                    f"Building Global Mapper — {inserted:,}/{total_tiles:,} tiles",
+                ),
+                100,
+            )
+    except Exception:
+        target.close()
+        if output_path.exists():
+            output_path.unlink()
+        raise
+    finally:
+        try:
+            target.close()
+        except Exception:
+            pass
+    return {
+        "bbox": bbox,
+        "inserted": inserted,
+        "format": expected_format,
+        "min_zoom": min_zoom,
+        "max_zoom": max_zoom,
+        "source_bytes": int(scan_result["bytes"]),
+        "source_layout": "global-mapper-z-y-x",
+        "metadata_path": str(scan_result["metadata_path"]),
+    }
 
 
 def scan_global_mapper_zip(
@@ -722,15 +1131,15 @@ def scan_global_mapper_zip(
 
             trusted_metadata: list[tuple[str, str, str]] = []
             for info, member_name in metadata_candidates:
-                detected = _read_global_mapper_metadata(archive, info)
+                detected = _read_global_mapper_zip_metadata(archive, info)
                 if detected is not None:
                     tile_format, declared_extension = detected
                     trusted_metadata.append((member_name, tile_format, declared_extension))
             if len(trusted_metadata) != 1:
                 raise ValueError(
                     tr(
-                        "ZIP не распознан как экспорт Global Mapper: нужен один безопасный *.gm_source_def.xml с creator=\"Global Mapper\" и шаблоном BaseURL Z%z/%y/%x.<формат>.",
-                        "The ZIP is not recognized as a Global Mapper export: it needs one safe *.gm_source_def.xml with creator=\"Global Mapper\" and a Z%z/%y/%x.<format> BaseURL template.",
+                        "ZIP не распознан как экспорт Global Mapper: нужен один безопасный *.gm_source_def.xml с официальным creator Global Mapper и шаблоном BaseURL Z%z/%y/%x.<формат>.",
+                        "The ZIP is not recognized as a Global Mapper export: it needs one safe *.gm_source_def.xml with an official Global Mapper creator and a Z%z/%y/%x.<format> BaseURL template.",
                     )
                 )
 
@@ -1593,7 +2002,12 @@ def xyz_to_pmtiles(
         )
     result = {
         "status": "ok",
-        "source_type": "xyz-directory-read-only",
+        "source_type": (
+            "global-mapper-directory-read-only"
+            if source_result.get("source_layout") == "global-mapper-z-y-x"
+            else "xyz-directory-read-only"
+        ),
+        "source_layout": source_result.get("source_layout", "xyz-z-x-y"),
         "source": str(tiles_root),
         "output": str(output_path),
         "tiles": source_result,

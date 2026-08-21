@@ -425,8 +425,8 @@ class App(tk.Tk):
         ttk.Label(
             xyz_tab,
             text=tr(
-                "Папки: 13/5424/2568.jpg и z13/x5424/y2568.jpg. ZIP Global Mapper Z/y/x определяется по XML.",
-                "Folders: 13/5424/2568.jpg and z13/x5424/y2568.jpg. Global Mapper Z/y/x ZIPs are detected by XML.",
+                "XYZ: 13/5424/2568.jpg. Папки и ZIP Global Mapper Z/y/x определяются по XML.",
+                "XYZ: 13/5424/2568.jpg. Global Mapper Z/y/x folders and ZIPs are detected by XML.",
             ),
             style="CardMuted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
