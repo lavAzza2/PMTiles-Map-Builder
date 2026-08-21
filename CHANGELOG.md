@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 — 2026-08-15
+## 0.5.0 — 2026-08-21
 
 - Added direct folder and ZIP import for Global Mapper raster tile exports with
   the trusted `Z<zoom>/<y>/<x>.<ext>` layout and official creator variants.
